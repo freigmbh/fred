@@ -23,4 +23,4 @@ Run offline checks with `pnpm test` and `pnpm -r typecheck`. Run the isolated lo
 
 - Contributions follow [CONTRIBUTING.md](CONTRIBUTING.md). The GitHub repository is a public mirror of FREI's GitLab; maintainers land accepted pull requests there.
 - Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
-- FRED is released under the [MIT License](LICENSE). Copyright FREI GmbH.
+- FRED is released under the [MIT License](LICENSE). Copyright Frei GmbH Software-Engineering.
