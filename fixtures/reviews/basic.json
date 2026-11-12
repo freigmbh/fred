@@ -1,0 +1,7 @@
+{
+  "source": "Synthetic review used by offline worker service-layer tests. Not a provider recording.",
+  "detect": {
+    "candidates": [{ "file": "src/counter.ts", "line": 2, "severity": "should_fix", "title": "Preserve a zero input", "body": "An input of zero is replaced with one. Use nullish coalescing so zero remains zero." }]
+  },
+  "validate": { "verdicts": [{ "index": 0, "verdict": "accepted" }], "findingDecisions": [] }
+}

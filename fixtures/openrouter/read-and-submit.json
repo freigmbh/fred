@@ -1,0 +1,52 @@
+[
+  {
+    "id": "synthetic-read",
+    "object": "chat.completion",
+    "created": 1,
+    "model": "synthetic/review-model",
+    "system_fingerprint": null,
+    "choices": [{
+      "index": 0,
+      "finish_reason": "tool_calls",
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "reasoning": "Synthetic reasoning fixture.",
+        "reasoning_details": [
+          { "type": "reasoning.text", "text": "Inspect the checkout.", "signature": "synthetic-signature", "index": 0 },
+          { "type": "reasoning.encrypted", "data": "synthetic-encrypted-reasoning", "index": 1 }
+        ],
+        "tool_calls": [
+          { "id": "read-source", "type": "function", "function": { "name": "read", "arguments": "{\"path\":\"source.ts\"}" } },
+          { "id": "missing-skill", "type": "function", "function": { "name": "load_skill", "arguments": "{\"name\":\"missing-review-skill\"}" } },
+          { "id": "denied-write", "type": "function", "function": { "name": "write", "arguments": "{\"path\":\"source.ts\",\"content\":\"changed\"}" } }
+        ]
+      }
+    }],
+    "usage": {
+      "prompt_tokens": 100,
+      "completion_tokens": 20,
+      "total_tokens": 120,
+      "prompt_tokens_details": { "cached_tokens": 40, "cache_write_tokens": 10 },
+      "completion_tokens_details": { "reasoning_tokens": 5 },
+      "cost": 0.025
+    }
+  },
+  {
+    "id": "synthetic-submit",
+    "object": "chat.completion",
+    "created": 2,
+    "model": "synthetic/review-model",
+    "system_fingerprint": null,
+    "choices": [{
+      "index": 0,
+      "finish_reason": "tool_calls",
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [{ "id": "review", "type": "function", "function": { "name": "submit_review", "arguments": "{\"candidates\":[]}" } }]
+      }
+    }],
+    "usage": { "prompt_tokens": 180, "completion_tokens": 10, "total_tokens": 190, "cost": 0.01 }
+  }
+]

@@ -1,0 +1,15 @@
+.git
+.repos
+.claude
+.agents
+.playwright-mcp
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.local.example
+docker/tls
+release.tar.gz
+release.json
+release-notes.md

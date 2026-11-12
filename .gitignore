@@ -1,0 +1,15 @@
+.playwright-mcp/
+.DS_Store
+node_modules/
+apps/worker/dist/
+release.tar.gz
+.env
+.env.*
+!.env.example
+.repos/*
+!.repos/README.md
+!.env.local.example
+apps/ui/dist/
+release.json
+release-notes.md
+docker/tls/

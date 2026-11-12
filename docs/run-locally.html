@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to run and operate the AI review stack</title>
+<style>
+:root { color-scheme: dark; }
+body { margin: 0; background: #000; color: #fff; font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; }
+main { max-width: 900px; margin: 0 auto; padding: 32px 20px 80px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 40px 0 10px; padding-top: 12px; border-top: 1px solid #222; }
+p, li { max-width: 78ch; }
+ul, ol { padding-left: 22px; margin: 6px 0; }
+li { margin: 4px 0; }
+code { background: #111; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+pre { background: #0a0a0a; border: 1px solid #222; padding: 12px; overflow-x: auto; font-size: 13px; line-height: 1.45; }
+pre code { background: none; padding: 0; }
+.muted { color: #999; }
+a { color: #fff; }
+pre.mermaid { background: #fff; border: 1px solid #ccc; border-radius: 4px; color: #111; padding: 16px; text-align: center; }
+pre.mermaid svg { max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<main>
+<h1>How to run and operate the AI review stack</h1>
+<p class="muted">How-to. Use a controller on your own machine. Local Docker checks capture GitLab effects; real GitLab acceptance uses a dedicated fixture project. You need Docker, Node 22.9 or newer, pnpm, and jq. Convex is self-hosted; no cloud login is used.</p>
+<p>To run all of FRED on one server, use <a href="#docker-deployment">Deploy FRED with Docker</a>. To investigate a deployed review, use <a href="#investigate">Investigate a failed, stalled, or missing review</a>; for spend, <a href="#monthly-spend">View monthly spend</a>.</p>
+
+<pre class="mermaid">
+graph LR
+  GL["GitLab, company network"] -- "webhook over an in-network route" --> B
+  subgraph Laptop
+    subgraph Docker["docker compose"]
+      B["Convex backend, 3210 clients, 3211 HTTP actions"]
+      Dash["dashboard, 6791"]
+      Vol[(SQLite volume)]
+      B --- Vol
+      Dash -- admin key --> B
+    end
+    Wk["worker, pnpm --filter @fred/worker start"] -- CONVEX_URL --> B
+    CLI["pnpm convex deploy"] -- admin key --> B
+  end
+  Wk -- "clone, read MR, post review" --> GL
+  Wk --> OR["OpenRouter API"]
+  B -- "public model catalog" --> OR
+</pre>
+
+<h2 id="docker-development">Verify changes in local Docker</h2>
+<p>Use this workflow to verify the current checkout without deploying to fred. Start Docker with Linux containers, then run:</p>
+<pre><code>pnpm fred dev verify</code></pre>
+<p>The command installs dependencies in Docker, starts an isolated Convex backend, connects its fixture project, and checks one FRED review with simulated model responses. It reports assertions, captured comments, and the source hash. Services started by this command stop when it finishes.</p>
+<p>To keep a development instance running for repeated investigation:</p>
+<pre><code>pnpm fred dev up
+pnpm fred dev verify --scenario provider-failure
+pnpm fred dev inspect --json
+pnpm fred dev logs</code></pre>
+<p>Open the dashboard URL printed by <code>up</code>. Use the printed controller URL and the key from the private admin-key file named in that output. Each worktree has its own instance and ports. After editing code, run <code>up</code> or <code>verify</code> again to rebuild the source snapshot.</p>
+<p>To work on the admin UI against that instance, run the <code>adminUi</code> command printed by <code>up</code>, then open the Vite URL and log in with the secret from the private admin-secret file named in that output. The instance is seeded with a month of sample reviews, usage, and failures on <code>fixtures/sample</code>, a project verification never touches. Inspection output excludes its sample jobs, findings, and usage.</p>
+<p>After an OpenRouter adapter change, put <code>OPENROUTER_API_TOKEN</code> in your host environment, root <code>.env.dev</code>, or <code>apps/worker/.env</code>, then run:</p>
+<pre><code>pnpm fred dev verify --live openrouter</code></pre>
+<p>To select a model and reasoning effort for both fixture stages, pass explicit overrides:</p>
+<pre><code>pnpm fred dev verify --live openrouter --model anthropic/claude-fable-5.1 --effort high</code></pre>
+<p>Agents may run these explicit local checks. They spend provider budget and capture comments locally. A pass requires both review stages and the known fixture defect. Real GitLab checkout, webhook delivery, and accepted MR comments still need the dedicated fixture-project procedure below. A passing local check does not prove those integrations.</p>
+<p>To verify a large review through both model stages and captured publication, run the synthetic scenario first, then the live adapter:</p>
+<pre><code>pnpm fred dev verify --scenario large-diff
+pnpm fred dev verify --scenario large-diff --live openrouter</code></pre>
+<p>This scenario generates 653 changed entries with long nested paths and more than 17 MB of diff text. Its manifest exceeds the inline budget. It requires both stages to read the complete paged catalog, follow diff continuation cursors and confirm the zero-input and deleted-module defects. Read the reported prompt sizes, assertions, and source hash. Checkout and GitLab publication remain simulated; the live command spends OpenRouter budget.</p>
+<p>To remove the local containers while retaining their database and captured results:</p>
+<pre><code>pnpm fred dev down</code></pre>
+<p>To discard the instance entirely, or to sweep instances left by deleted worktrees, use <a href="#clean-up">the cleanup procedure</a>.</p>
+<p>If a command was forcibly killed and reports an existing lock directory, confirm the recorded process has exited before removing that directory. Use the source hash in verification output when reporting what was tested. See <a href="reference.html#local-development">the local development reference</a> for isolation, credentials, and coverage limits.</p>
+
+<h2 id="docker-deployment">Deploy FRED with Docker</h2>
+<p>The <a href="reference.html#docker">Docker stack</a> runs the backend, controller, worker, dashboard, and admin UI on one server with Docker Compose. You need Docker with Compose 2.20 or newer, a checkout of the release to run, and a hostname GitLab can reach over the company network.</p>
+<pre class="mermaid">
+graph LR
+  GL["GitLab"] -- "webhook, /api/webhook/gitlab" --> Web
+  Admin["admin browser"] --> Web
+  subgraph Stack["docker compose, project fred"]
+    Web["web: nginx and admin UI"] --> B["backend: Convex"]
+    Web --> Dash["dashboard"]
+    Key["admin-key"] -.-> Dep["deploy"]
+    Dep -- "env, functions, settings" --> B
+    Wk["worker"] -- "127.0.0.1:3210" --> B
+    B --- Vol[("backend-data")]
+  end
+  Wk -- "clone, read MR, post review" --> GL
+  Wk --> OR["OpenRouter API"]
+  B -- "public model catalog" --> OR
+</pre>
+<ol>
+<li>Create the configuration next to the compose file and keep it private:
+<pre><code>cd docker
+cp .env.example .env
+chmod 600 .env</code></pre></li>
+<li>Set <code>FRED_PUBLIC_URL</code>, <code>FRED_DASHBOARD_URL</code>, <code>GITLAB_URL</code>, and <code>OPENROUTER_API_TOKEN</code>. Fill <code>INSTANCE_SECRET</code>, <code>WORKER_SECRET</code>, <code>ADMIN_SECRET</code>, and <code>GITLAB_WEBHOOK_SECRET</code> with separate <code>openssl rand -hex 32</code> values. Keep <code>INSTANCE_SECRET</code> for as long as you keep the database. Choose the worker mode: <code>fixture</code> with <code>WORKER_FIXTURE_PROJECT_IDS</code> and <code>AI_REVIEW_LIVE=1</code> for named projects, or <code>service</code> for every connected project.</li>
+<li>For HTTPS, put the certificate chain and private key into <code>docker/tls/</code> as <code>tls.crt</code> and <code>tls.key</code>, or point <code>FRED_TLS_DIR</code> at a directory holding them. The web server reads them as user and group 101, so give that group access without opening the key to other users:
+<pre><code>sudo chgrp -R 101 tls
+sudo chmod 750 tls
+sudo chmod 640 tls/tls.crt tls/tls.key</code></pre>
+Copy the files rather than linking them: the container sees only this directory, so a link to certbot's <code>live/</code> directory points nowhere and the web server refuses to start. Without them, the stack serves plain HTTP for an existing TLS proxy in front of it.</li>
+<li>Optionally set <code>FRED_VERSION</code> to the output of <code>pnpm --silent fred --version</code>, so reviews, usage, and the admin UI carry the version. Then build and start:
+<pre><code>docker compose build
+docker compose up -d --wait</code></pre>
+<code>up</code> returns once the deploy job has configured the controller and the worker, dashboard, and web server are running.</li>
+<li>Open <code>FRED_PUBLIC_URL</code> and log in with <code>ADMIN_SECRET</code>. A new controller starts with reviews switched off.</li>
+<li>Open <code>FRED_DASHBOARD_URL</code> and log in with the deployment URL, which is <code>FRED_PUBLIC_URL</code>, and the admin key from:
+<pre><code>docker compose exec backend ./generate_admin_key.sh</code></pre>
+In <strong>Data &gt; settings</strong>, set <code>globalEnabled</code> to <code>true</code> when the deployment is ready for reviews.</li>
+<li>Connect each project and add its webhook with <a href="setup-gitlab.html">the GitLab setup</a>. The webhook URL is <code>FRED_PUBLIC_URL</code> followed by <code>/api/webhook/gitlab</code>.</li>
+</ol>
+<p>To upgrade or roll back, check out the release, update <code>FRED_VERSION</code>, and run:</p>
+<pre><code>docker compose build
+docker compose stop worker
+docker compose up -d --wait</code></pre>
+<p>Stopping the worker first drains running reviews, for up to two hours, before the deploy job replaces the controller functions. Without it, the old worker keeps claiming reviews while the new functions deploy, and a contract change between the versions fails those reviews. Rolling back deploys the older functions; the database is never restored, and an incompatible schema change needs operator intervention.</p>
+<p>To read logs, run <code>docker compose logs -f worker</code>, or name another service. To run the controller's Convex CLI, for example to <a href="#maintenance-mode">enable maintenance mode</a>, use the deploy service:</p>
+<pre><code>docker compose run --rm --no-deps deploy convex env set FRED_MAINTENANCE_MODE true</code></pre>
+<p>The deploy job resets <code>WORKER_SECRET</code>, <code>ADMIN_SECRET</code>, <code>GITLAB_WEBHOOK_SECRET</code>, <code>GITLAB_URL</code>, and <code>BOT_USER_IDS_OTHER</code> to their <code>.env</code> values on every <code>up</code>, so change or rotate those in <code>.env</code>, not with <code>convex env set</code>.</p>
+<p>The <code>backend-data</code> volume holds the database, stored files such as transcripts, sealed project tokens, and the controller's <code>FRED_TOKEN_KEY</code>. Back it up together with <code>.env</code>; the volume alone cannot be opened without <code>INSTANCE_SECRET</code>. Keep backups private and outside the checkout, where image builds never read them. Stop the stack for a consistent copy:</p>
+<pre><code>mkdir -p -m 700 ~/fred-backups
+docker compose stop
+docker run --rm -v fred_backend-data:/data:ro -v ~/fred-backups:/backup -e OWNER="$(id -u):$(id -g)" alpine \
+  sh -c 'umask 077 && tar -czf /backup/fred-backend-data.tgz -C /data . && chown "$OWNER" /backup/fred-backend-data.tgz'
+docker compose up -d --wait</code></pre>
+<p><code>docker compose down</code> removes containers and keeps the volumes. <code>docker compose down --volumes</code> deletes the database and the token key, so every stored project token and all review history are gone.</p>
+
+<h2 id="clean-up">Clean up artifacts</h2>
+<p>Two places keep build and runtime leftovers past the command that created them.</p>
+<table>
+<tr><th>Artifact</th><th>Procedure</th></tr>
+<tr><td>Build output: <code>apps/worker/dist</code>, <code>apps/ui/dist</code>, and <code>release.tar.gz</code></td><td><code>pnpm clean</code>. The next <code>pnpm build</code> recreates them.</td></tr>
+<tr><td>Local Docker instances under <code>~/.local/share/fred-dev/</code>, with their containers, volumes, and built images</td><td><code>pnpm fred dev clean</code>. Removes this worktree's instance, including its database and captured results, and every instance whose recorded worktree no longer exists. Run it before deleting a worktree, or from any worktree to sweep orphans. An orphan still owned by a running command, or a state directory without recorded metadata, is left alone and reported as skipped.</td></tr>
+</table>
+<p>CI release archives expire after seven days. Review checkouts, e2e backends, and their temporary directories are scoped resources their command removes on exit. After a forced kill, remove <code>fred-review-*</code> and <code>fred-e2e-*</code> directories in the system temporary directory and any <code>fred-e2e-*</code> container by hand.</p>
+
+<h2 id="switch-models">Switch a project's review models</h2>
+<ol>
+<li>Log in to the intended FRED admin UI and open <strong>Projects</strong>. Select the project and open its <strong>Review</strong> tab.</li>
+<li>Click <strong>Refresh</strong> under the panes to load OpenRouter's current compatible models.</li>
+<li>Select the model and effort for detection and validation.</li>
+<li>Click <strong>Save</strong>, which appears once a selection changed.</li>
+</ol>
+<p>Newly queued reviews in that project use the saved pipeline. Queued and running reviews keep theirs. To abandon unsaved edits, click <strong>Discard</strong>. If another session saved first, the save is rejected; reload the project and choose again. The available combinations are listed in the <a href="reference.html#models">pipeline reference</a>.</p>
+
+<h2 id="maintenance-mode">Enable maintenance mode</h2>
+<p>In the intended self-hosted Convex dashboard, open <strong>Settings &gt; Environment Variables</strong> and set <code>FRED_MAINTENANCE_MODE</code> to <code>true</code>. The controller must have the maintenance gate deployed.</p>
+<p>To use the CLI, first check that <code>apps/controller/.env.local</code> targets the intended self-hosted deployment. From the repository root, run:</p>
+<pre><code>pnpm --filter @fred/controller convex env set FRED_MAINTENANCE_MODE true</code></pre>
+<p>FRED declines new requests with this comment:</p>
+<pre><code>AI review not run: FRED is currently under maintenance. Please request a review again once maintenance is complete.</code></pre>
+<p>Queued analysis gets the same denial at its next claim. Running reviews and saved publication continue. The controller delivers denial comments even when the worker is stopped.</p>
+<p>To end maintenance, delete the variable in the dashboard or run:</p>
+<pre><code>pnpm --filter @fred/controller convex env set FRED_MAINTENANCE_MODE false</code></pre>
+<p>To delete the variable through the CLI:</p>
+<pre><code>pnpm --filter @fred/controller convex env remove FRED_MAINTENANCE_MODE</code></pre>
+<p>Ask reviewers to remove and re-add <strong>0 FRED</strong> after maintenance. Native re-requests also work on supported GitLab versions. Denied requests do not restart automatically.</p>
+
+<h2 id="setup-wizard">Configure the stack with the wizard</h2>
+<p>From the repository root, install dependencies and start the interactive wizard:</p>
+<pre><code>pnpm install
+pnpm run setup</code></pre>
+<p>Use <code>pnpm run setup</code>. The shorter <code>pnpm setup</code> invokes pnpm's own installer.</p>
+<p>The wizard covers the backend target, controller connection, GitLab, OpenRouter token, review settings, and saving. Each prompt explains its purpose and whether it is required or optional. Press Enter to keep a saved value. For optional fields, enter <code>-</code> to clear the value or restore the displayed default.</p>
+<p>Choose <code>existing</code> for a self-hosted controller that is already running. Choose <code>local</code> to prepare the Docker backend configuration. The local path asks you to start the backend and generate its admin key in a second terminal before continuing. Keep the existing instance secret when using an existing database.</p>
+<p>Allow the read-only controller check to reuse existing runtime values, especially shared secrets and <code>FRED_TOKEN_KEY</code>. The wizard generates <code>FRED_TOKEN_KEY</code> only when none is saved. Applying refuses to replace a different key already on the controller, because every stored project token would become unreadable. The wizard asks for no GitLab token. It explains the remaining GitLab steps: connect each project's <code>0 FRED</code> project access token on the admin <strong>Projects</strong> page, then add its project webhook with <strong>Merge request events</strong> and <strong>Comments</strong>. See <a href="setup-gitlab.html">the GitLab setup</a>. Provider billing is verified during the supervised pilot.</p>
+<p>The wizard previews the output files and hides secrets. It writes owner-only env files and retains unrelated variables. Applying controller runtime values is a separate confirmation naming the target deployment; the wizard reads the values back to verify the update. It does not deploy functions, start services, call models, or start reviews.</p>
+<p>For a new controller, the closing stage opens the dashboard and provides the initial <code>settings</code> row. Copy it only when no row exists. It starts with <code>globalEnabled: false</code>. The wizard does not change existing policy rows. If you skip applying controller variables or enabling fixture startup, the closing summary names those remaining steps. Rerun the wizard to apply saved values later.</p>
+<p>Copy the worker configuration securely to the service account on the intended worker host. Choose each project's models in the admin UI when connecting it. Configuration is stored in:</p>
+<ul>
+<li><code>apps/controller/self-hosted/.env</code> for a local Docker backend.</li>
+<li><code>apps/controller/.env.local</code> for deployment URL and admin key.</li>
+<li><code>apps/controller/.env.runtime</code> as the local copy of controller runtime variables.</li>
+<li><code>apps/worker/.env</code> for the worker.</li>
+</ul>
+<p>Run <code>pnpm run test:setup</code> for the offline setup checks. These checks also run under <code>pnpm test</code>. The manual steps below remain available when configuring a component separately.</p>
+
+<h2>Start the self-hosted Convex backend</h2>
+<ol>
+<li>Create the env file next to the compose file and set the instance secret:
+<pre><code>cd apps/controller/self-hosted
+cp .env.example .env
+INSTANCE_SECRET=$(openssl rand -hex 32)
+awk -v secret="$INSTANCE_SECRET" '/^INSTANCE_SECRET=/ {$0="INSTANCE_SECRET=" secret} {print}' .env &gt; .env.tmp
+mv .env.tmp .env</code></pre>
+<code>.env</code> is gitignored. Keep <code>REV</code> pinned to the tag written in the template. Image tags on ghcr.io are full commit shas of convex-backend, not the <code>precompiled-*</code> release names on GitHub. To move to a newer build, pick a commit on <code>main</code> that has an image for both the backend and the dashboard. Not every dashboard image at a sha boots; <code>DASHBOARD_REV</code> overrides the dashboard tag alone and defaults to <code>REV</code>. Leave <code>POSTGRES_URL</code> empty. The MVP uses SQLite on the Docker volume.</li>
+<li>Start the backend and the dashboard. The first pull is about a gigabyte:
+<pre><code>docker compose up -d
+docker compose ps</code></pre>
+The backend listens on 3210 for clients and 3211 for HTTP actions and shows <code>healthy</code> in <code>ps</code>. The dashboard listens on 6791.</li>
+<li>Generate an admin key and write it into the controller's env file:
+<pre><code>KEY=$(docker compose exec -T backend ./generate_admin_key.sh | tail -1)
+printf 'CONVEX_SELF_HOSTED_URL=http://127.0.0.1:3210\nCONVEX_SELF_HOSTED_ADMIN_KEY=%s\n' "$KEY" &gt; ../.env.local</code></pre>
+Every <code>pnpm convex</code> command below reads <code>apps/controller/.env.local</code>. That file is gitignored. Never point it at a shared deployment from a laptop.</li>
+</ol>
+<p>If you see an error that mentions Convex Pro, the concurrency knobs are too low. The env template sets all four <code>APPLICATION_MAX_CONCURRENT_*</code> values to 64. Check they survived the copy.</p>
+
+<h2>Deploy the controller</h2>
+<ol>
+<li>Install and check the workspace from the repo root:
+<pre><code>pnpm install
+pnpm -r typecheck
+pnpm test</code></pre></li>
+<li>Deploy the functions:
+<pre><code>cd apps/controller
+pnpm convex deploy -y</code></pre>
+Repeat this after every change to <code>apps/controller/convex/</code>. Use <code>pnpm convex dev</code> instead to redeploy on save. Note that <code>pnpm convex codegen</code> also pushes functions when <code>.env.local</code> names a reachable deployment.</li>
+<li>Set the controller's environment on the deployment. Pick a webhook secret and keep it, the replay step needs it:
+<pre><code>SECRET=$(openssl rand -hex 16)
+echo "GITLAB_WEBHOOK_SECRET=$SECRET" &gt;&gt; .env.local
+pnpm convex env set GITLAB_WEBHOOK_SECRET "$SECRET"
+pnpm convex env set GITLAB_URL https://gitlab.example.com
+pnpm convex env set BOT_USER_IDS_OTHER 300
+pnpm convex env set FRED_TOKEN_KEY "$(openssl rand -base64 32)"
+WORKER_SECRET=$(openssl rand -hex 32)
+printf 'WORKER_SECRET=%s\n' "$WORKER_SECRET" &gt;&gt; .env.local
+pnpm convex env set WORKER_SECRET "$WORKER_SECRET"</code></pre>
+User 300 matches the Renovate-style author in <code>fixtures/webhooks/</code>. Set <code>FRED_TOKEN_KEY</code> once and keep it with the database; a new key makes every stored project token unreadable. GitLab tokens are not environment variables: <a href="setup-gitlab.html#connect-project">connect each project</a> with its <code>0 FRED</code> token in the admin UI. Without a connected project, merge request webhooks are ignored, comment delivery is recorded as <code>failed</code> in <code>mrNotes</code>, and command verification fails without changing a finding.</li>
+<li>Insert the single <code>settings</code> row:
+<pre><code>printf '{"globalEnabled":true,"defaultBudgetUsd":3000,"orgTimezone":"Europe/Berlin"}\n' &gt; /tmp/settings.jsonl
+pnpm convex import --table settings --format jsonLines -y /tmp/settings.jsonl</code></pre>
+Every webhook and every claim fails loudly until this row exists. To flip the kill switch later, edit the row in the dashboard or import again with <code>--replace</code>. The import command sometimes hangs after printing that it added the document; Ctrl-C is safe at that point.</li>
+<li>Open the dashboard at <code>http://127.0.0.1:6791</code>. It asks for the deployment URL, <code>http://127.0.0.1:3210</code>, and the admin key from <code>.env.local</code>. Confirm the tables from the schema exist. Port 3210 itself is the API and has no page.</li>
+</ol>
+
+<h2>Replay a webhook without GitLab</h2>
+<p>This is the controller path on your machine: token check, project lookup, trigger detection, dedupe, policy, enqueue. Most webhook fixtures are hand-written; <code>reviewer-added-gitlab-18.0.json</code> is a scrubbed real delivery. They target GitLab project 7 with user 901 as its <code>0 FRED</code> bot. Connecting needs a real project access token, so on a stack without a connected project 7 every merge request fixture returns <code>{"ignored":true,"reason":"project not connected to FRED"}</code>. Use <code>pnpm fred dev verify</code>, which connects its own fixture project, to exercise the queue and worker without GitLab.</p>
+<pre><code>cd apps/controller
+SECRET=$(grep GITLAB_WEBHOOK_SECRET .env.local | cut -d= -f2)
+post() { curl -s -X POST http://127.0.0.1:3211/webhook/gitlab -H "X-Gitlab-Token: $SECRET" -H "Content-Type: application/json" --data @"$1"; echo; }
+
+post ../../fixtures/webhooks/reviewer-added.json
+post ../../fixtures/webhooks/duplicate-delivery.json
+post ../../fixtures/webhooks/push-while-assigned.json
+post ../../fixtures/webhooks/comment-only.json</code></pre>
+<p>Then look at the queue the way the worker does, and claim a job by hand:</p>
+<pre><code>WORKER_SECRET=$(grep '^WORKER_SECRET=' .env.local | cut -d= -f2-)
+ARGS=$(jq -cn --arg workerSecret "$WORKER_SECRET" '{workerSecret:$workerSecret,providers:["fred"],workerId:"manual-local-check"}')
+pnpm convex run jobs:listQueued "$(printf '%s' "$ARGS" | jq 'del(.workerId)')"
+pnpm convex run jobs:claim "$ARGS"
+pnpm convex data reviewJobs</code></pre>
+<p>The claimed job is <code>running</code> with <code>claimedAt</code>, <code>leaseToken</code>, and <code>leaseExpiresAt</code> set. A manual claim without heartbeats expires and produces a failure comment delivery. A wrong webhook token gets 401. Worker calls with an invalid secret are rejected. Webhook delivery dedupe rejects replay. Use a fresh delivery and head SHA for another push case, or a fresh deliberate re-request for another attempt at the same SHA.</p>
+<p>To see a denial, set <code>globalEnabled</code> to false, replay a fixture with a fresh sha, and read the response. The job is not inserted. Read <code>pnpm convex data mrNotes</code> for the denial comment and delivery status. With placeholder GitLab configuration, delivery fails as expected.</p>
+
+<p>After fixing a failed comment delivery, retry its existing <code>mrNotes</code> row from the dashboard or CLI:</p>
+<pre><code>pnpm convex run mrNotes:retryFailed '{"noteId":"&lt;mrNotes document id&gt;"}'</code></pre>
+
+<h2>Reset</h2>
+<p>To start from an empty database without redeploying, clear the tables from the dashboard. To wipe everything including the admin key:</p>
+<pre><code>cd apps/controller/self-hosted
+docker compose down -v</code></pre>
+<p>Then repeat the admin key step, deploy, and set the environment again.</p>
+
+<h2>Expose the webhook to GitLab</h2>
+<p>GitLab must reach port 3211 on your machine. If GitLab runs on the company network and your machine is on it, use your machine's address. Otherwise open a tunnel that stays inside the company network and point the fixture project webhook at it. Do not use a public tunnel service.</p>
+<p>Once a real delivery has arrived, save its body from the webhook's recent deliveries page into <code>fixtures/webhooks/</code> next to the hand-written ones. The trigger detection depends on the exact shape of <code>changes.reviewers</code>, and the hand-written fixtures are a guess until then.</p>
+
+<h2>Run offline worker checks</h2>
+<p>From the repo root, run the checks before using provider keys:</p>
+<pre><code>pnpm install
+pnpm -r typecheck
+pnpm test</code></pre>
+<p>These tests use local fixtures, fake transports, and temporary checkout files. They do not spend provider budget or post to GitLab.</p>
+
+<h2>Prepare a human-run fixture review</h2>
+<p>Use a local self-hosted Convex backend and the Node worker. This procedure spends OpenRouter budget and posts real GitLab comments, so it requires explicit fixture-project authorization.</p>
+<ol>
+<li>Use a dedicated fixture project on the company GitLab instance. Create an MR with a small known defect, root <code>REVIEW.md</code>, and a referenced repo <code>SKILL.md</code>. Create its <code>0 FRED</code> token, connect it in the local admin UI with <code>ADMIN_SECRET</code> set as in <a href="#admin-ui">Open the admin UI</a>, and configure its project webhook with <a href="setup-gitlab.html">the GitLab setup guide</a>.</li>
+<li>Keep <code>CONVEX_URL</code> on your machine and configure <code>WORKER_SECRET</code> and <code>FRED_TOKEN_KEY</code> on that local controller. Point only the fixture project's webhook at that controller.</li>
+<li>Copy <code>apps/worker/.env.example</code> to <code>apps/worker/.env</code>. Fill the values for this human-run check. The start command loads that optional file; already exported environment values take precedence:
+<pre><code>CONVEX_URL=http://127.0.0.1:3210
+WORKER_MODE=fixture
+WORKER_FIXTURE_PROJECT_IDS=&lt;fixture project numeric ID&gt;
+AI_REVIEW_LIVE=1
+WORKER_SECRET=&lt;the local controller's worker secret&gt;
+GITLAB_URL=https://&lt;internal GitLab host&gt;
+OPENROUTER_API_TOKEN=&lt;service OpenRouter token&gt;
+WORKER_CONCURRENCY=8</code></pre>
+The worker receives each project's token with its claim; its environment holds no GitLab token. Keep values out of Git. Fixture mode restricts the controller and project targets; it still spends real provider budget and posts as the project's FRED bot.</li>
+<li>Start the worker from the repo root:
+<pre><code>pnpm --filter @fred/worker start</code></pre>
+The worker logs <code>FRED worker connected and waiting for reviews</code>. Keep service mode and the shared controller out of this local pilot.</li>
+</ol>
+
+<h2>Verify FRED on GitLab</h2>
+<p>Select the models to exercise in the fixture project's pipeline on the admin <strong>Projects</strong> page. Use only the fixture MR and keep <code>AI_REVIEW_LIVE=1</code> set.</p>
+<ol>
+<li>Add <strong>0 FRED</strong> as reviewer. Confirm the worker claims the expected fixture project and SHA.</li>
+<li>Check that the review follows root <code>REVIEW.md</code> and loads the referenced repo skill. Repeat with a missing skill and with no <code>REVIEW.md</code>; expect a hint and a feature tip respectively.</li>
+<li>Include instructions that request a shell command, a write, and a host file outside the checkout. Verify that the worker exposes only its controlled tools and that worker credentials are unavailable. Stop the pilot if any forbidden capability succeeds.</li>
+<li>Confirm that the summary contains every accepted finding and nit, actionable findings use valid inline locations, and FRED sets its <code>fred-review::</code> label. Check a review with no new findings and an earlier open actionable finding. Expect its remaining count and link in the summary, and <code>fred-review::findings</code>.</li>
+<li>Check <code>reviewJobs</code>, <code>findings</code>, and <code>usageEvents</code> in the local dashboard. Expect a saved result before publication, ordered acknowledgements, every finding status retained, and usage deltas with stable event keys. Investigate <code>usageIncomplete</code>; missing observations are not proof of zero cost.</li>
+<li>Interrupt an analysis and re-request it deliberately after the failure. Interrupt publication after the summary and restart the worker. Expect publication recovery without another model run or duplicate summary.</li>
+<li>On the fixture project, push another commit during a review. Verify that outdated results remain stored, detected outdated work stops further publication, and the queued review handles the new head.</li>
+<li>Temporarily stop the local controller. Verify that claims and publication pause, active analysis stops after bounded reconnection attempts, and the worker remains alive. Restore the controller and verify interruption reporting and saved-publication recovery.</li>
+</ol>
+<p>Record the SDK version, requested and resolved models, observed tool availability, GitLab result, and usage behavior. Follow <a href="../fixtures/README.md">the fixture recording instructions</a> before saving responses. Synthetic tests alone do not establish these live properties.</p>
+
+<h2 id="verify-finding-commands">Verify finding decisions on a fixture MR</h2>
+<p>Use an existing review on the dedicated fixture MR and the local controller. This procedure posts real GitLab comments and requires explicit fixture-project authorization. The command itself makes no model call. Use a published FRED finding; commands on findings of the retired Claude and Codex bots are rejected.</p>
+<ol>
+<li>Enable <strong>Comments</strong> on the fixture project's existing webhook. Keep <strong>Merge request events</strong> enabled.</li>
+<li>As the MR author or a project Maintainer, copy the finding reference from its summary or inline comment. Post one plain line:
+<pre><code>fred dismiss &lt;finding-ref&gt; The behavior is intentional.</code></pre>
+Replace <code>&lt;finding-ref&gt;</code> with the published reference. Do not wrap the command in backticks or add another line.</li>
+<li>Wait for the worker to finish any active work on that MR. Check for the dismissal reply, its reason, and its decision reference. If the finding has an inline discussion, expect that discussion to resolve. Summary-only findings receive a separate decision comment.</li>
+<li>Check <code>findingCommandRequests</code>, <code>findingCommands</code>, and <code>findingDecisions</code> in the local dashboard. Expect a completed command and one human decision tied to the source note. The finding remains posted with dismissed disposition. Expect no new review, usage row, or reviewed SHA.</li>
+<li>Check the FRED label. If another open blocking or should-fix finding remains, expect <code>fred-review::findings</code>. Otherwise expect <code>fred-review::clean</code>, including when only nits remain.</li>
+<li>Copy the decision reference from the dismissal reply and post:
+<pre><code>fred undo &lt;decision-ref&gt; The requirement still applies.</code></pre>
+Expect a new audit row, open disposition, and an open inline discussion when one exists. The earlier decision remains stored.</li>
+<li>Edit or delete an already accepted command comment. Confirm that the finding's disposition does not change. Resolve its GitLab discussion manually and confirm that its disposition and FRED label remain unchanged.</li>
+<li>For a validator retraction, check the evidence and decision reference in the next review summary. Undo that current retraction to verify the same reopen behavior. A code fix remains fixed and is ineligible for undo.</li>
+</ol>
+<p>If a command produces no reply, inspect its note webhook delivery and stored receipt. An ignored delivery can be an edited note, a bot or system note, invalid command syntax, or an unknown project. Verification fails when the project is not connected. Use a new comment for a corrected command.</p>
+<p>The webhook acknowledges a stored receipt before GitLab verification begins. If verification fails, inspect <code>findingCommandRequests</code> and its durable failure note. Correct the configuration or availability problem and submit a new command after retries are exhausted.</p>
+<p>If publication fails, inspect the command's saved result, acknowledgements, and failure comment. Any accepted decision remains in effect. After bounded recovery is exhausted, the next review recalculates its label from current dispositions. See <a href="reference.html#finding-commands">the command reference</a> for states and limits.</p>
+
+<h2 id="concurrent-e2e">Test concurrent reviews offline</h2>
+<p>Run <code>pnpm test:e2e</code> with Docker available. The command creates a disposable self-hosted backend, deploys the controller with test-only internal fixtures in a temporary directory, and removes the container afterward. The disposable SQLite database lives in container memory. The checks exercise real transactions, not disk durability. They use synthetic provider and GitLab service layers, never provider credentials or real MRs.</p>
+<p>The command sets a fresh <code>FRED_TOKEN_KEY</code> and connects fixture project 1 through <code>e2e:connectFixture</code> with a sealed token, so each claim proves the sealing round trip. The checks run reviews of four MRs with concurrent usage, diagnostics, heartbeats, and stale cleanup. They also exercise webhook replay, failed-analysis retries, and saved-publication recovery. CI runs the checks against a disposable GitLab service with public fixture credentials; it requires no privileged Docker daemon. These tests establish controller and worker behavior. Use the local live verifier for OpenRouter and the authorized fixture project for real GitLab acceptance.</p>
+
+<h2 id="investigate">Investigate a failed, stalled, or missing review</h2>
+<p>Run these commands in <code>docker/</code> on the server of a <a href="#docker-deployment">Docker deployment</a>. They read state and change nothing. Never print or paste <code>.env</code> or the admin key.</p>
+<ol>
+<li>Check the services and the deployed version:
+<pre><code>docker compose ps
+grep FRED_VERSION .env</code></pre></li>
+<li>Get the controller’s record. A failure comment on the MR names the job ID. Select a job, an MR, or recent work:
+<pre><code>docker compose run --rm --no-deps deploy convex run diagnostics:inspect '{"jobId":"&lt;job ID&gt;"}'
+docker compose run --rm --no-deps deploy convex run diagnostics:inspect '{"projectPath":"group/project","mrIid":42,"provider":"fred"}'
+docker compose run --rm --no-deps deploy convex run diagnostics:inspect '{}'</code></pre></li>
+<li>A failure reason that names a missing access token means the project was disconnected or its token cannot be opened; check <code>FRED_TOKEN_KEY</code> and the <strong>Projects</strong> page. Otherwise read the job’s <code>snapshot.failure</code>. The category and codes route the problem: authentication, invalid-request, transport, and output failures need different fixes. <code>detail</code> is the redacted cause chain. For a stall, compare <code>snapshot.lastActivityAt</code> with <code>leaseExpiresAt</code> and the event times. The controller holds no tool events, and its <code>lastActivityAt</code> can trail the worker by about 70 seconds; the worker log below has every tool event at its exact time. A heartbeat establishes worker ownership, not model progress.</li>
+<li>Read the worker’s timeline for the job. Every diagnostic event, and the failure with every stack, is one JSON line in the worker log:
+<pre><code>docker compose logs --no-log-prefix --since 48h worker | grep '&lt;job ID&gt;' | jq -Rc 'fromjson? | .event // {failure, phase}'
+docker compose logs --no-log-prefix --since 48h worker | grep '&lt;job ID&gt;' | jq -Rr 'fromjson? | select(.fredFailure) | .trace'
+docker compose logs --no-log-prefix --tail 200 worker | grep -v fredDiagnostic</code></pre>
+<code>fromjson?</code> skips the readable warning lines that share the job ID. The last command shows startup, connection, claim, and failure warnings without the event stream.</li>
+<li>For controller errors, read Convex function logs and the backend log. <code>logs</code> streams until <code>timeout</code> ends it.
+<pre><code>timeout 20 docker compose run --rm --no-deps deploy convex logs --history 200
+docker compose logs --tail 200 backend</code></pre></li>
+<li>For a missing job, read the MR report’s <code>webhook_received</code> and <code>webhook_ignored</code> events and their reasons. Reason <code>unconfigured</code> means the project is not connected; check its token on the admin <strong>Projects</strong> page. Then read the web server: <code>docker compose logs --no-log-prefix web | grep webhook/gitlab | tail</code>. <code>noWebhookReceipt</code> means no receipt in the retained scan, not that GitLab sent nothing. When both are empty, inspect the project’s webhook delivery history in GitLab. HTTP 401 indicates a missing or mismatched secret.</li>
+<li>For incomplete publication, compare <code>publication.acknowledged</code> and <code>total</code> with the publication events. Note rows show status, attempts, and the last GitLab delivery error. A saved result alone does not prove that GitLab received it; confirm the summary and label on the MR.</li>
+<li>For raw tables, use <code>docker compose run --rm --no-deps deploy convex data &lt;table&gt; --limit 20 --order desc</code> or the dashboard at <code>FRED_DASHBOARD_URL</code>.</li>
+</ol>
+<p>The worker log keeps events the controller dropped; the controller keeps job snapshots, failure rows, and notes after detailed events expire at seven days. Read every coverage flag and narrow a truncated report to a job. Do not rerun a real MR review just to obtain evidence; use the local OpenRouter verifier for an isolated model check. See <a href="reference.html#diagnostics">the diagnostic reference</a> for what each record contains.</p>
+
+<h2 id="backfill-usage-day">Backfill usage days</h2>
+<p>Usage rows written before the <code>day</code> column existed have no day bucket, so they are missing from the daily spend chart. Run this once per deployment after deploying a controller that has the column. It patches 500 rows per call; repeat until <code>remaining</code> is <code>false</code>. It changes no cost or token amount.</p>
+<pre><code>pnpm --filter @fred/controller convex run migrations:backfillUsageDay</code></pre>
+<p>Confirm <code>apps/controller/.env.local</code> targets the intended self-hosted deployment first. Once every deployment reports <code>remaining: false</code>, the column becomes required in the schema in a follow-up change.</p>
+
+<h2 id="backfill-usage-rollups">Backfill usage rollups</h2>
+<p>The spend page and the budget gate read <code>usageDaily</code> and <code>usageMonthly</code>, which <code>recordUsage</code> fills for every row written since the deploy that introduced them. Older ledger rows are missing from both until this runs, so spend under-reports and budgets look fresher than they are. Run it once per deployment right after that deploy. It folds 200 rows per call, oldest first, marks each row <code>rolledUp</code>, and skips rows already marked; repeat until <code>remaining</code> is <code>false</code>. Rerunning or resuming after an interruption adds nothing twice. It changes no ledger amount.</p>
+<pre><code>pnpm --filter @fred/controller convex run migrations:backfillUsageRollups</code></pre>
+<p>Confirm <code>apps/controller/.env.local</code> targets the intended self-hosted deployment first. The worker can keep running. Rows without a <code>day</code> get one from their creation time, so <a href="#backfill-usage-day">backfilling usage days</a> first is not required. Afterwards compare the spend page's month total with the <a href="#monthly-spend">ledger query</a>; they agree to within half a micro-dollar per ledger row, well under a cent, since the rollup rounds each row to the micro-dollar before summing.</p>
+
+<h2 id="backfill-review-outcomes">Backfill review outcomes</h2>
+<p>The overview's outcome table reads <code>reviewOutcomes</code>, which <code>jobs.complete</code> fills for every review completed since the deploy that introduced it. Earlier done reviews are missing until this runs, so the month's done count, clean labels, findings, and latency under-report. Run it once per deployment right after that deploy. It writes the rows of 10 done jobs per call, oldest first, so a call stays under the read limit even when saved results are near the 1 MiB document limit, and returns a <code>cursor</code>; pass it back until <code>remaining</code> is <code>false</code>. The loop below does that and stops on the first failed call. Jobs that already have a row are skipped, so rerunning or resuming adds nothing twice. It changes no job or finding.</p>
+<pre><code>args='{}'; while out=$(pnpm --silent --filter @fred/controller convex run migrations:backfillReviewOutcomes "$args"); do
+  echo "$out"; [ "$(jq -r .remaining &lt;&lt;&lt;"$out")" = true ] || break; args=$(jq -c '{cursor}' &lt;&lt;&lt;"$out")
+done</code></pre>
+<p>Confirm <code>apps/controller/.env.local</code> targets the intended self-hosted deployment first. The worker can keep running. The overview shows the month's earlier reviews once the loop ends with <code>remaining: false</code>.</p>
+
+<h2 id="recount-outcome-findings">Recount outcome findings</h2>
+<p><code>reviewOutcomes</code> rows written before duplicates were excluded count each duplicate finding by severity, so the overview's finding counts and the Reviews totals run high for those reviews. Run this once right after the deploy that introduces <code>migrations.recountOutcomeFindings</code>. It recounts 10 rows per call from their <code>findings</code> rows, patches only rows whose counts differ, and returns a <code>cursor</code>; pass it back until <code>remaining</code> is <code>false</code>. Rerunning or resuming patches nothing twice. It changes no job or finding.</p>
+<pre><code>args='{}'; while out=$(pnpm --silent --filter @fred/controller convex run migrations:recountOutcomeFindings "$args"); do
+  echo "$out"; [ "$(jq -r .remaining &lt;&lt;&lt;"$out")" = true ] || break; args=$(jq -c '{cursor}' &lt;&lt;&lt;"$out")
+done</code></pre>
+<p>Confirm <code>apps/controller/.env.local</code> targets the intended self-hosted deployment first. The worker can keep running.</p>
+
+<h2 id="backfill-finding-disposition">Backfill legacy finding dispositions</h2>
+<p>Run this explicit migration after deploying a controller with <code>migrations.backfillFindingDisposition</code>. Test it on your local instance first. On a shared deployment, an authorized operator runs the migration during a maintenance window.</p>
+<ol>
+<li>Confirm that <code>apps/controller/.env.local</code> names the intended self-hosted URL and admin key. Do not use a Convex Cloud target.</li>
+<li>Pause the worker and let its current work finish. Maintenance mode alone does not stop finding commands.</li>
+<li>From the repository root, run:
+<pre><code>pnpm --filter @fred/controller convex run migrations:backfillFindingDisposition</code></pre>
+Each call processes at most 500 matching findings. Repeat until <code>remaining</code> is <code>false</code>.</li>
+<li>Inspect the migrated rows. Legacy posted findings have open disposition. Legacy resolved findings become posted with fixed disposition and a decision whose <code>source</code> is <code>migration</code>. Its reason states that original decision metadata is unavailable.</li>
+<li>Check that saved <code>reviewJobs.resultJson</code> values remain unchanged. Resume the worker.</li>
+</ol>
+<p>The migration records its own provenance. It does not reconstruct the original actor or decision time. Historical result decoding remains available without changing old publication effects or markers.</p>
+
+<h2 id="admin-ui">Open the admin UI</h2>
+<p>Set the read credential on the controller once. Confirm <code>apps/controller/.env.local</code> targets the intended deployment, then run:</p>
+<pre><code>pnpm --filter @fred/controller convex env set ADMIN_SECRET &lt;random 32 byte hex&gt;</code></pre>
+<p>Open the admin UI, <code>FRED_PUBLIC_URL</code> on the Docker stack, and enter that secret. The browser keeps it until you log out or the controller rejects it. Overview shows queue health, this month's outcomes and latency, and the failure ledger. Outcomes always list FRED and list a retired bot only in a month in which it completed reviews. Queue shows every job in flight in one table per stage, queued, running, and publishing, with ticking ages, the worker phase, and publication progress, and marks a lease past due, a running review with no provider activity, and a recovered publication. Spend shows the selected month per day and lab, the working-day burn rate, and the month's breakdown per model and per budget owner. Projects connects, checks, and disconnects projects, edits their review pipelines, switches transcript collection, and refreshes the model catalog. Policy changes stay in the Convex dashboard.</p>
+
+<h2 id="collect-transcripts">Collect stage transcripts</h2>
+<p>Transcript collection stores each review stage's full model conversation for later evaluation. It is off by default and switched per project. A transcript contains the source code, diffs, and MR discussions the agent read. Tell the project's team before you switch it on. Deleting is a Convex write; on a shared deployment it needs operator authorization.</p>
+<ol>
+<li>Open the project on the admin UI's <strong>Projects</strong> page. Connecting creates its <code>projects</code> row.</li>
+<li>On its <strong>Review</strong> tab, under <strong>Transcripts</strong>, choose <strong>Collect</strong>, then <strong>Confirm collect</strong>. Without the admin UI, open <strong>Functions</strong> in the intended self-hosted Convex dashboard, select <code>transcripts:setCollection</code>, and run it with the project path and <code>enabled</code>. On the Docker stack, the deploy service does the same:
+<pre><code>docker compose run --rm --no-deps deploy convex run transcripts:setCollection '{"projectPath":"group/project","enabled":true}'</code></pre>
+For another deployment, confirm <code>apps/controller/.env.local</code> targets it, then use <code>pnpm --filter @fred/controller convex run</code> with the same arguments.</li>
+<li>Reviews queued after the switch collect. Queued and running reviews keep the setting they were queued with. Choose <strong>Stop</strong>, or run the same function with <code>"enabled":false</code>, to stop collecting; already queued collecting jobs still store their transcripts.</li>
+<li>To download, open <strong>Reviews</strong> in the admin UI and expand the review. Each stage attempt lists its outcome, model, size, and turns with a download. The file is gzipped JSON; read it with <code>gunzip -c fred-*.json.gz | jq</code>.</li>
+</ol>
+<table>
+<tr><th>Expanded review shows</th><th>Meaning</th></tr>
+<tr><td>Collection off</td><td>The job was queued while the project's switch was off.</td></tr>
+<tr><td>None recorded</td><td>The job collects, but no stage reached its first model request, or the store failed. A failed store leaves a warning in the worker journal.</td></tr>
+<tr><td>Too large</td><td>The gzipped transcript exceeded 8 MiB. The row keeps its metadata without a file.</td></tr>
+</table>
+<p>Transcripts remain until deleted. To delete one job's transcripts, or every transcript of an MR:</p>
+<pre><code>docker compose run --rm --no-deps deploy convex run transcripts:deleteForJob '{"jobId":"&lt;job ID&gt;"}'
+docker compose run --rm --no-deps deploy convex run transcripts:deleteForMr '{"projectPath":"group/project","mrIid":42}'</code></pre>
+<p>Switches and deletions append <code>policyAudit</code> rows. Deletion leaves findings, usage, and decisions intact. See <a href="reference.html#transcripts">the transcript reference</a> for the file contents and limits.</p>
+
+<h2 id="export-data">Export all data</h2>
+<p>The admin UI downloads everything the controller stores as one zip. The archive holds source code from reviewed MRs and developer names, usernames, and GitLab IDs, so keep it where you would keep the repositories.</p>
+<ol>
+<li>Open <strong>Export</strong> in the admin UI and choose <strong>Export all data</strong>. Keep the tab open: leaving the page asks first, then cancels the export and discards what it read.</li>
+<li>The page reads each table page by page, then downloads the transcript files four at a time, and shows each table's rows, size, and status. When it finishes, the browser saves <code>fred-export-YYYY-MM-DD-HHmm.zip</code>, named by the local start time. <strong>Save again</strong> downloads the same archive; <strong>Start over</strong> returns to the start.</li>
+<li>Each request is tried 3 times. After that the export stops, keeps what it read in the tab, and offers <strong>Retry from</strong> the table or the transcript files where it stopped, or <strong>Discard</strong>. A rejected admin secret logs out. <strong>Cancel</strong> discards the export.</li>
+</ol>
+<pre><code>manifest.json              formatVersion fred-export/1, fredVersion, exportedAt, rows per table, transcript file count, notes
+tables/&lt;table&gt;.jsonl       one stored document per line, with _id and _creationTime
+transcripts/&lt;id&gt;.json.gz   one file per available transcript, named by its transcripts row _id, stored as gzip</code></pre>
+<p>Rows join on <code>_id</code>. Sealed project tokens, lease tokens, and storage IDs are left out, and <code>webhookDeliveries</code> is not exported. The browser reads each table page by page and each transcript file separately, so rows written during the export may or may not appear: the archive is not a point-in-time snapshot. A transcript file deleted after its row was read is left out and counted on the page. When no table has a row, the page says there is nothing to export instead of saving a zip. Read a transcript with <code>unzip -p fred-export-*.zip transcripts/&lt;id&gt;.json.gz | gunzip | jq</code>. See <a href="reference.html#admin-queries">the admin API</a> for the exported fields and page sizes.</p>
+
+<h2 id="monthly-spend">View monthly spend</h2>
+<p>The admin UI above is the first stop. The query below sums the ledger directly and is the fallback when the UI is unavailable, and the cross-check for the <code>usageMonthly</code> rollup the server reads.</p>
+<ol>
+<li>Log in to the self-hosted Convex dashboard and open <strong>Data</strong>.</li>
+<li>Open the menu next to a table and choose <strong>Custom query</strong>.</li>
+<li>Paste this entire module, including <code>export default query</code>. Set <code>month</code> to the stored calendar month you want, then run the query:
+<pre><code>export default query({
+	handler: async (ctx) =&gt; {
+		const month = "2026-09";
+		const developers = await ctx.db.query("developers").collect();
+		return await Promise.all(developers.map(async (developer) =&gt; {
+			const rows = await ctx.db.query("usageEvents")
+				.withIndex("by_developer_month", (q) =&gt;
+					q.eq("developerId", developer._id).eq("month", month))
+				.collect();
+			return {
+				user: developer.username ?? developer.gitlabUserId,
+				gitlabUserId: developer.gitlabUserId,
+				month,
+				spentUsd: Number(rows.reduce((sum, row) =&gt; sum + row.costUsd, 0).toFixed(4)),
+			};
+		}));
+	},
+});</code></pre></li>
+</ol>
+<p>A developer with no usage in that month returns zero. An empty developer table returns an empty list. A top-level <code>return</code> without the wrapper causes <code>Illegal return statement</code>. Treat the result as recorded estimated spend, subject to the <a href="reference.html#spend-limits">usage limits</a>. The query changes no data and requires no software deployment.</p>
+
+<h2>Upgrade the backend</h2>
+<ol>
+<li>Export first:
+<pre><code>cd apps/controller &amp;&amp; pnpm convex export --path ../../backup.zip</code></pre></li>
+<li>Change <code>REV</code> in <code>self-hosted/.env</code> to the new commit sha. Set or clear <code>DASHBOARD_REV</code> to match, and check the dashboard serves a page afterwards.</li>
+<li>Run <code>docker compose up -d</code> again.</li>
+</ol>
+</main>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "base",
+    themeVariables: {
+      fontFamily: "ui-sans-serif, system-ui, sans-serif",
+      primaryColor: "#ffffff",
+      primaryTextColor: "#111",
+      primaryBorderColor: "#444",
+      secondaryColor: "#e8e8e8",
+      tertiaryColor: "#f4f4f4",
+      lineColor: "#222",
+      textColor: "#111",
+      background: "#fff",
+      clusterBkg: "#f0f0f0",
+      clusterBorder: "#999",
+      actorBkg: "#ffffff",
+      actorBorder: "#444",
+      noteBkgColor: "#fff8d6",
+      noteBorderColor: "#999",
+    },
+  });
+</script>
+</body>
+</html>

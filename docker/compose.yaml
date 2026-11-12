@@ -1,0 +1,149 @@
+name: fred
+
+x-runtime: &runtime
+  image: ${FRED_IMAGE:-fred}:${FRED_TAG:-local}
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+    target: runtime
+    args:
+      FRED_VERSION: ${FRED_VERSION:-}
+      FRED_RELEASE_SHA: ${FRED_RELEASE_SHA:-}
+  network_mode: service:net
+  init: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+
+x-backend-image: &backend-image ghcr.io/convex/convex-backend:4d58e45bcf49d01ec696b31db7faec7362df45ad
+
+services:
+  # Owns the network namespace that backend, deploy, and worker share, so a backend restart keeps the worker's
+  # 127.0.0.1:3210 route.
+  net:
+    image: *backend-image
+    entrypoint: [sleep, infinity]
+    init: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks:
+      default:
+        aliases: [backend]
+
+  backend:
+    image: *backend-image
+    network_mode: service:net
+    depends_on: [net]
+    restart: unless-stopped
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    volumes:
+      - backend-data:/convex/data
+    environment:
+      INSTANCE_NAME: ${INSTANCE_NAME:-fred}
+      INSTANCE_SECRET: ${INSTANCE_SECRET:?Set INSTANCE_SECRET in .env}
+      CONVEX_CLOUD_ORIGIN: ${FRED_PUBLIC_URL:?Set FRED_PUBLIC_URL in .env}
+      CONVEX_SITE_ORIGIN: ${FRED_PUBLIC_URL}/api
+      DISABLE_BEACON: "true"
+      DISABLE_METRICS_ENDPOINT: "true"
+      DO_NOT_REQUIRE_SSL: "true"
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:3210/version]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 12
+
+  admin-key:
+    image: *backend-image
+    network_mode: none
+    entrypoint: [/bin/sh, -c, 'umask 077 && ./generate_key "$$INSTANCE_NAME" "$$INSTANCE_SECRET" > /run/fred/admin-key && chown 1000:1000 /run/fred/admin-key']
+    volumes:
+      - keys:/run/fred
+    environment:
+      INSTANCE_NAME: ${INSTANCE_NAME:-fred}
+      INSTANCE_SECRET: ${INSTANCE_SECRET:?Set INSTANCE_SECRET in .env}
+
+  deploy:
+    <<: *runtime
+    command: [deploy]
+    volumes:
+      - keys:/run/fred:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      admin-key:
+        condition: service_completed_successfully
+    environment:
+      CONVEX_SELF_HOSTED_URL: http://127.0.0.1:3210
+      FRED_ADMIN_KEY_FILE: /run/fred/admin-key
+      WORKER_SECRET: ${WORKER_SECRET:?Set WORKER_SECRET in .env}
+      ADMIN_SECRET: ${ADMIN_SECRET:?Set ADMIN_SECRET in .env}
+      GITLAB_WEBHOOK_SECRET: ${GITLAB_WEBHOOK_SECRET:?Set GITLAB_WEBHOOK_SECRET in .env}
+      GITLAB_URL: ${GITLAB_URL:?Set GITLAB_URL in .env}
+      BOT_USER_IDS_OTHER: ${BOT_USER_IDS_OTHER:-}
+      FRED_MONTHLY_BUDGET: ${FRED_MONTHLY_BUDGET:-3000}
+      FRED_TIMEZONE: ${FRED_TIMEZONE:-Europe/Berlin}
+
+  worker:
+    <<: *runtime
+    command: [worker]
+    restart: unless-stopped
+    stop_grace_period: 2h
+    depends_on:
+      deploy:
+        condition: service_completed_successfully
+    environment:
+      CONVEX_URL: http://127.0.0.1:3210
+      WORKER_SECRET: ${WORKER_SECRET:?Set WORKER_SECRET in .env}
+      GITLAB_URL: ${GITLAB_URL:?Set GITLAB_URL in .env}
+      OPENROUTER_API_TOKEN: ${OPENROUTER_API_TOKEN:?Set OPENROUTER_API_TOKEN in .env}
+      WORKER_MODE: ${WORKER_MODE:-fixture}
+      WORKER_FIXTURE_PROJECT_IDS: ${WORKER_FIXTURE_PROJECT_IDS:-}
+      AI_REVIEW_LIVE: ${AI_REVIEW_LIVE:-}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+
+  dashboard:
+    image: ghcr.io/convex/convex-dashboard@sha256:284a2638e0c1a4ec0c2327d8219776f3a426ca5824b81686ae4d9454dc0ce8ed
+    restart: unless-stopped
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    environment:
+      NEXT_PUBLIC_DEPLOYMENT_URL: ${FRED_PUBLIC_URL:?Set FRED_PUBLIC_URL in .env}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  web:
+    image: ${FRED_WEB_IMAGE:-fred-web}:${FRED_TAG:-local}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: web
+      args:
+        FRED_VERSION: ${FRED_VERSION:-}
+        FRED_RELEASE_SHA: ${FRED_RELEASE_SHA:-}
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - ${FRED_HTTP_PORT:-80}:8080
+      - ${FRED_HTTPS_PORT:-443}:8443
+      - ${FRED_DASHBOARD_PORT:-8443}:9443
+    volumes:
+      - ${FRED_TLS_DIR:-./tls}:/etc/nginx/tls:ro
+    environment:
+      FRED_PUBLIC_URL: ${FRED_PUBLIC_URL:?Set FRED_PUBLIC_URL in .env}
+      FRED_DASHBOARD_URL: ${FRED_DASHBOARD_URL:?Set FRED_DASHBOARD_URL in .env}
+    depends_on:
+      backend:
+        condition: service_healthy
+        restart: true
+      dashboard:
+        condition: service_started
+        restart: true
+
+volumes:
+  backend-data:
+  keys:

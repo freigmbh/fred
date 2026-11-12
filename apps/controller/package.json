@@ -1,0 +1,24 @@
+{
+  "name": "@fred/controller",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "codegen": "convex codegen",
+    "convex": "convex"
+  },
+  "dependencies": {
+    "@fred/contracts": "workspace:*",
+    "@openrouter/sdk": "1.4.21",
+    "convex": "^1.46.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@edge-runtime/vm": "^5.0.0",
+    "convex-test": "^0.0.60",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
+  }
+}

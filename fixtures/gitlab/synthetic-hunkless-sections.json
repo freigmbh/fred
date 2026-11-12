@@ -1,0 +1,498 @@
+{
+  "accepted": [
+    {
+      "name": "unchanged rename",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": true,
+        "deleted_file": false,
+        "old_path": "events/useAlarmActions.test.tsx",
+        "new_path": "alarms/useAlarmActions.test.tsx"
+      },
+      "raw": "diff --git a/events/useAlarmActions.test.tsx b/alarms/useAlarmActions.test.tsx\nsimilarity index 100%\nrename from events/useAlarmActions.test.tsx\nrename to alarms/useAlarmActions.test.tsx\n"
+    },
+    {
+      "name": "unchanged rename with mode change",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": true,
+        "deleted_file": false,
+        "old_path": "bin/run",
+        "new_path": "scripts/run"
+      },
+      "raw": "diff --git a/bin/run b/scripts/run\nold mode 100644\nnew mode 100755\nsimilarity index 100%\nrename from bin/run\nrename to scripts/run\n"
+    },
+    {
+      "name": "unchanged rename with quoted path",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": true,
+        "deleted_file": false,
+        "old_path": "ä.gql",
+        "new_path": "alarms/ä.gql"
+      },
+      "raw": "diff --git \"a/\\303\\244.gql\" \"b/alarms/\\303\\244.gql\"\nsimilarity index 100%\nrename from \"\\303\\244.gql\"\nrename to \"alarms/\\303\\244.gql\"\n"
+    },
+    {
+      "name": "empty file deletion",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": "certs/.gitkeep",
+        "new_path": "certs/.gitkeep"
+      },
+      "raw": "diff --git a/certs/.gitkeep b/certs/.gitkeep\ndeleted file mode 100644\nindex e69de29..0000000\n"
+    },
+    {
+      "name": "empty file addition with full sha",
+      "file": {
+        "diff": "",
+        "new_file": true,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "new/.gitkeep",
+        "new_path": "new/.gitkeep"
+      },
+      "raw": "diff --git a/new/.gitkeep b/new/.gitkeep\nnew file mode 100644\nindex 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n"
+    },
+    {
+      "name": "mode-only change",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n"
+    },
+    {
+      "name": "binary modification",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "logo.png",
+        "new_path": "logo.png"
+      },
+      "raw": "diff --git a/logo.png b/logo.png\nindex bdc955b..8835708 100644\nBinary files a/logo.png and b/logo.png differ\n"
+    },
+    {
+      "name": "binary modification with mode change",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "tool.bin",
+        "new_path": "tool.bin"
+      },
+      "raw": "diff --git a/tool.bin b/tool.bin\nold mode 100644\nnew mode 100755\nindex bdc955b..8835708\nBinary files a/tool.bin and b/tool.bin differ\n"
+    },
+    {
+      "name": "binary addition",
+      "file": {
+        "diff": "",
+        "new_file": true,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "icon.png",
+        "new_path": "icon.png"
+      },
+      "raw": "diff --git a/icon.png b/icon.png\nnew file mode 100644\nindex 0000000..8835708\nBinary files /dev/null and b/icon.png differ\n"
+    },
+    {
+      "name": "binary deletion",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": "old.png",
+        "new_path": "old.png"
+      },
+      "raw": "diff --git a/old.png b/old.png\ndeleted file mode 100644\nindex 8835708..0000000\nBinary files a/old.png and /dev/null differ\n"
+    },
+    {
+      "name": "changed binary rename",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": true,
+        "deleted_file": false,
+        "old_path": "a.png",
+        "new_path": "img/a.png"
+      },
+      "raw": "diff --git a/a.png b/img/a.png\nsimilarity index 90%\nrename from a.png\nrename to img/a.png\nindex bdc955b..8835708 100644\nBinary files a/a.png and b/img/a.png differ\n"
+    },
+    {
+      "name": "binary modification with \" and \" in path",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "docs/before and after.png",
+        "new_path": "docs/before and after.png"
+      },
+      "raw": "diff --git a/docs/before and after.png b/docs/before and after.png\nindex bdc955b..8835708 100644\nBinary files a/docs/before and after.png and b/docs/before and after.png differ\n"
+    },
+    {
+      "name": "binary deletion with \" and \" in path",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": "docs/before and after.png",
+        "new_path": "docs/before and after.png"
+      },
+      "raw": "diff --git a/docs/before and after.png b/docs/before and after.png\ndeleted file mode 100644\nindex 8835708..0000000\nBinary files a/docs/before and after.png and /dev/null differ\n"
+    }
+  ],
+  "rejected": [
+    {
+      "name": "rename below 100% without content",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": true,
+        "deleted_file": false,
+        "old_path": "old.ts",
+        "new_path": "new.ts"
+      },
+      "raw": "diff --git a/old.ts b/new.ts\nsimilarity index 90%\nrename from old.ts\nrename to new.ts\n"
+    },
+    {
+      "name": "rename with mismatched from path",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": true,
+        "deleted_file": false,
+        "old_path": "old.ts",
+        "new_path": "new.ts"
+      },
+      "raw": "diff --git a/old.ts b/new.ts\nsimilarity index 100%\nrename from other.ts\nrename to new.ts\n"
+    },
+    {
+      "name": "rename with trailing index",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": true,
+        "deleted_file": false,
+        "old_path": "old.ts",
+        "new_path": "new.ts"
+      },
+      "raw": "diff --git a/old.ts b/new.ts\nsimilarity index 100%\nrename from old.ts\nrename to new.ts\nindex 1234567..abcdef0 100644\n"
+    },
+    {
+      "name": "rename without rename flag",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "old.ts",
+        "new_path": "new.ts"
+      },
+      "raw": "diff --git a/old.ts b/new.ts\nsimilarity index 100%\nrename from old.ts\nrename to new.ts\n"
+    },
+    {
+      "name": "copy metadata",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": true,
+        "deleted_file": false,
+        "old_path": "old.ts",
+        "new_path": "new.ts"
+      },
+      "raw": "diff --git a/old.ts b/new.ts\nsimilarity index 100%\ncopy from old.ts\ncopy to new.ts\n"
+    },
+    {
+      "name": "rename header only",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": true,
+        "deleted_file": false,
+        "old_path": "old.ts",
+        "new_path": "new.ts"
+      },
+      "raw": "diff --git a/old.ts b/new.ts\n"
+    },
+    {
+      "name": "deletion with non-empty blob",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": ".gitkeep",
+        "new_path": ".gitkeep"
+      },
+      "raw": "diff --git a/.gitkeep b/.gitkeep\ndeleted file mode 100644\nindex 1234567..0000000\n"
+    },
+    {
+      "name": "deletion with wrong absent side",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": ".gitkeep",
+        "new_path": ".gitkeep"
+      },
+      "raw": "diff --git a/.gitkeep b/.gitkeep\ndeleted file mode 100644\nindex 0000000..e69de29\n"
+    },
+    {
+      "name": "deletion without mode",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": ".gitkeep",
+        "new_path": ".gitkeep"
+      },
+      "raw": "diff --git a/.gitkeep b/.gitkeep\nindex e69de29..0000000\n"
+    },
+    {
+      "name": "deletion with index mode suffix",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": ".gitkeep",
+        "new_path": ".gitkeep"
+      },
+      "raw": "diff --git a/.gitkeep b/.gitkeep\ndeleted file mode 100644\nindex e69de29..0000000 100644\n"
+    },
+    {
+      "name": "deletion without deleted flag",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": ".gitkeep",
+        "new_path": ".gitkeep"
+      },
+      "raw": "diff --git a/.gitkeep b/.gitkeep\ndeleted file mode 100644\nindex e69de29..0000000\n"
+    },
+    {
+      "name": "deletion with trailing text",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": ".gitkeep",
+        "new_path": ".gitkeep"
+      },
+      "raw": "diff --git a/.gitkeep b/.gitkeep\ndeleted file mode 100644\nindex e69de29..0000000\nunexpected\n"
+    },
+    {
+      "name": "deletion without final newline",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": ".gitkeep",
+        "new_path": ".gitkeep"
+      },
+      "raw": "diff --git a/.gitkeep b/.gitkeep\ndeleted file mode 100644\nindex e69de29..0000000"
+    },
+    {
+      "name": "text markers without hunks",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nindex 1234567..abcdef0 100644\n--- a/run.sh\n+++ b/run.sh\n"
+    },
+    {
+      "name": "index only",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nindex 1234567..abcdef0 100644\n"
+    },
+    {
+      "name": "equal modes",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100644\n"
+    },
+    {
+      "name": "lone mode line",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nnew mode 100755\n"
+    },
+    {
+      "name": "symlink type change",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 120000\n"
+    },
+    {
+      "name": "binary with mismatched marker path",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nindex bdc955b..8835708 100644\nBinary files a/other.sh and b/run.sh differ\n"
+    },
+    {
+      "name": "binary with mode change and index suffix",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\nindex bdc955b..8835708 100644\nBinary files a/run.sh and b/run.sh differ\n"
+    },
+    {
+      "name": "binary modification without index suffix",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nindex bdc955b..8835708\nBinary files a/run.sh and b/run.sh differ\n"
+    },
+    {
+      "name": "binary with equal blobs",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nindex 8835708..8835708 100644\nBinary files a/run.sh and b/run.sh differ\n"
+    },
+    {
+      "name": "binary patch payload",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nindex bdc955b..8835708 100644\nGIT binary patch\nliteral 2\nJcmZQzU|;|M00031\n\nliteral 2\nJcmZQzU|;|M00030\n\n"
+    },
+    {
+      "name": "malformed hunk introducer",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nindex 1234567..abcdef0 100644\n--- a/run.sh\n+++ b/run.sh\n@@ garbage\n"
+    },
+    {
+      "name": "binary marker with \" and \" but mismatched split",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "docs/before and after.png",
+        "new_path": "docs/before and after.png"
+      },
+      "raw": "diff --git a/docs/before and after.png b/docs/before and after.png\nindex bdc955b..8835708 100644\nBinary files a/docs/before and b/after.png differ\n"
+    },
+    {
+      "name": "deletion with unsupported file mode",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": true,
+        "old_path": ".gitkeep",
+        "new_path": ".gitkeep"
+      },
+      "raw": "diff --git a/.gitkeep b/.gitkeep\ndeleted file mode 000000\nindex e69de29..0000000\n"
+    },
+    {
+      "name": "binary modification with unsupported index mode",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nindex bdc955b..8835708 000000\nBinary files a/run.sh and b/run.sh differ\n"
+    },
+    {
+      "name": "mode-only change to an unsupported mode",
+      "file": {
+        "diff": "",
+        "new_file": false,
+        "renamed_file": false,
+        "deleted_file": false,
+        "old_path": "run.sh",
+        "new_path": "run.sh"
+      },
+      "raw": "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 000000\n"
+    }
+  ]
+}

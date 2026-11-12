@@ -1,0 +1,27 @@
+{
+  "name": "fred",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=22.9"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "clean": "rm -rf apps/worker/dist apps/ui/dist release.tar.gz release.json release-notes.md",
+    "setup": "bash scripts/setup.sh",
+    "fred": "node scripts/fred.mjs",
+    "test:setup": "node --test scripts/setup-env.test.mjs",
+    "typecheck": "pnpm -r --parallel typecheck",
+    "test": "node --test 'scripts/**/*.test.mjs' && vitest run",
+    "test:e2e": "node scripts/e2e.mjs",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "esbuild": "0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}

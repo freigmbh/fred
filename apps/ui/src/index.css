@@ -1,0 +1,186 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Frei brand in the Settings language: neutral light and dark surfaces, grouped inset boxes, an ink primary button that
+   becomes paper in dark. Frei green lives in --brand (links, active marks) and --sidebar-primary (the selected nav pill),
+   and --ring keeps focus green. Dark is plain gray, never green-tinted. Providers and labs keep their brand colors; ink-like
+   labs follow the foreground so they stay visible in dark. The shadcn tokens keep their stock meaning, so stock primitives
+   need no restyling. */
+@theme inline {
+  --font-sans: Metropolis, "Avenir Next", Futura, ui-sans-serif, system-ui, sans-serif;
+  --font-heading: var(--font-sans);
+  /* Body text is 13px; stock mira primitives use text-xs (12px). */
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: calc(1.25 / 0.8125);
+  /* md is the sidebar layout, lg the three-pane Projects page, xl the content column's width. */
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 900px;
+  --breakpoint-lg: 1100px;
+  --breakpoint-xl: 1360px;
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-brand: var(--brand);
+  --color-faint: var(--faint);
+  --color-bordeaux: var(--bordeaux);
+  --color-claude: var(--claude);
+  --color-codex: var(--codex);
+  --color-warning: var(--warning);
+  --color-nav-overview: var(--nav-overview);
+  --color-nav-queue: var(--nav-queue);
+  --color-nav-reviews: var(--nav-reviews);
+  --color-nav-spend: var(--nav-spend);
+  --color-nav-projects: var(--nav-projects);
+  --color-nav-export: var(--nav-export);
+  --radius-sm: 5px;
+  --radius-md: 7px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+}
+
+:root {
+  color-scheme: light;
+  --background: #f5f5f7;
+  --foreground: #1d1d1f;
+  --card: #ffffff;
+  --card-foreground: #1d1d1f;
+  --popover: #ffffff;
+  --popover-foreground: #1d1d1f;
+  --primary: #1d1d1f;
+  --primary-foreground: #ffffff;
+  --secondary: #ebebee;
+  --secondary-foreground: #1d1d1f;
+  --muted: #f0f0f2;
+  --muted-foreground: #515154;
+  --faint: #86868b;
+  --accent: #f0f0f2;
+  --accent-foreground: #1d1d1f;
+  --destructive: #730019;
+  --bordeaux: #730019;
+  --warning: #b06a00;
+  --border: #e2e2e6;
+  --input: #d9d9de;
+  --ring: #488128;
+  --brand: #488128;
+  --sidebar: #ececee;
+  --sidebar-foreground: #1d1d1f;
+  --sidebar-primary: #488128;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e1e1e4;
+  --sidebar-accent-foreground: #1d1d1f;
+  --sidebar-border: #e2e2e6;
+  --sidebar-ring: #488128;
+  /* Nav icon tiles: muted per page, Frei green for Overview. White glyphs on all of them. */
+  --nav-overview: #488128;
+  --nav-queue: #6b7280;
+  --nav-reviews: #2f6b1c;
+  --nav-spend: #b06a00;
+  --nav-projects: #4b5563;
+  --nav-export: #8e8e93;
+  --claude: #d97757;
+  --codex: #1d1d1f;
+  /* Ink-like labs: brand grays that must lift in dark. */
+  --lab-xai: #52575a;
+  --lab-zai: #3f4a5c;
+  --lab-moonshot: #7a7f78;
+  --chart-1: var(--claude);
+  --chart-2: var(--codex);
+  --chart-3: #488128;
+  --chart-4: #628552;
+  --chart-5: #730019;
+  --radius: 7px;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: #1a1a1c;
+  --foreground: #f0f0f2;
+  --card: #242426;
+  --card-foreground: #f0f0f2;
+  --popover: #2a2a2d;
+  --popover-foreground: #f0f0f2;
+  --primary: #f0f0f2;
+  --primary-foreground: #1a1a1c;
+  --secondary: #303033;
+  --secondary-foreground: #f0f0f2;
+  --muted: #2a2a2d;
+  --muted-foreground: #b4b4b8;
+  --faint: #7c7c82;
+  --accent: #2a2a2d;
+  --accent-foreground: #f0f0f2;
+  --destructive: #e06a7c;
+  --bordeaux: #e06a7c;
+  --warning: #e0a650;
+  --border: #333336;
+  --input: #3a3a3d;
+  --ring: #8abe69;
+  --brand: #8abe69;
+  --sidebar: #1e1e20;
+  --sidebar-foreground: #f0f0f2;
+  --sidebar-primary: #8abe69;
+  --sidebar-primary-foreground: #1a1a1c;
+  --sidebar-accent: #2a2a2d;
+  --sidebar-accent-foreground: #f0f0f2;
+  --sidebar-border: #333336;
+  --sidebar-ring: #8abe69;
+  /* Deep enough that the white glyphs keep their contrast on the dark sidebar. */
+  --nav-overview: #4f8a2e;
+  --nav-queue: #5f6670;
+  --nav-reviews: #3d7a28;
+  --nav-spend: #a8650a;
+  --nav-projects: #545c68;
+  --nav-export: #6e6e73;
+  --codex: #f0f0f2;
+  --lab-xai: #b9bdc0;
+  --lab-zai: #aab4c6;
+  --lab-moonshot: #b0b5ae;
+  --chart-3: #8abe69;
+  --chart-4: #9ccd7a;
+  --chart-5: #e06a7c;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans antialiased;
+  }
+  body {
+    @apply bg-background text-sm text-foreground;
+  }
+  button:not(:disabled), [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}

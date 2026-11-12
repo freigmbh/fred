@@ -1,0 +1,162 @@
+{
+  "object_kind": "merge_request",
+  "event_type": "merge_request",
+  "user": {
+    "id": 31,
+    "name": "Daniel Kistner",
+    "username": "daniel",
+    "avatar_url": "[REDACTED]",
+    "email": "[REDACTED]"
+  },
+  "project": {
+    "id": 9,
+    "name": "app",
+    "description": "",
+    "web_url": "https://gitlab.example.com/acme/app",
+    "avatar_url": "[REDACTED]",
+    "git_ssh_url": "git@gitlab.example.com:acme/app.git",
+    "git_http_url": "https://gitlab.example.com/acme/app.git",
+    "namespace": "Acme",
+    "visibility_level": 0,
+    "path_with_namespace": "acme/app",
+    "default_branch": "develop",
+    "ci_config_path": "",
+    "homepage": "https://gitlab.example.com/acme/app",
+    "url": "git@gitlab.example.com:acme/app.git",
+    "ssh_url": "git@gitlab.example.com:acme/app.git",
+    "http_url": "https://gitlab.example.com/acme/app.git"
+  },
+  "object_attributes": {
+    "assignee_id": 31,
+    "author_id": 31,
+    "created_at": "2026-09-01 12:57:06 UTC",
+    "description": "[REDACTED]",
+    "draft": true,
+    "head_pipeline_id": 3818,
+    "id": 1059,
+    "iid": 737,
+    "last_edited_at": "2026-09-01 15:58:25 UTC",
+    "last_edited_by_id": 31,
+    "merge_commit_sha": null,
+    "merge_error": null,
+    "merge_params": {
+      "force_remove_source_branch": "0"
+    },
+    "merge_status": "cannot_be_merged",
+    "merge_user_id": null,
+    "merge_when_pipeline_succeeds": false,
+    "milestone_id": null,
+    "source_branch": "t3code/layout-inset-shell",
+    "source_project_id": 9,
+    "state_id": 1,
+    "target_branch": "develop",
+    "target_project_id": 9,
+    "time_estimate": 0,
+    "title": "Draft: feat(web): layout v2",
+    "updated_at": "2026-09-04 12:06:02 UTC",
+    "updated_by_id": 31,
+    "prepared_at": "2026-09-01 12:57:09 UTC",
+    "assignee_ids": [
+      31
+    ],
+    "blocking_discussions_resolved": true,
+    "detailed_merge_status": "draft_status",
+    "first_contribution": false,
+    "human_time_change": null,
+    "human_time_estimate": null,
+    "human_total_time_spent": null,
+    "labels": [],
+    "last_commit": {
+      "id": "bcf13b86ef4ddf3e97c0eb9aa976a1fcb45f2348",
+      "message": "[REDACTED]",
+      "title": "[REDACTED]",
+      "timestamp": "2026-09-01T17:57:29+02:00",
+      "url": "https://gitlab.example.com/acme/app/-/commit/bcf13b86ef4ddf3e97c0eb9aa976a1fcb45f2348",
+      "author": {
+        "name": "Daniel Kistner",
+        "email": "[REDACTED]"
+      }
+    },
+    "reviewer_ids": [
+      62
+    ],
+    "source": {
+      "id": 9,
+      "name": "app",
+      "description": "",
+      "web_url": "https://gitlab.example.com/acme/app",
+      "avatar_url": "[REDACTED]",
+      "git_ssh_url": "git@gitlab.example.com:acme/app.git",
+      "git_http_url": "https://gitlab.example.com/acme/app.git",
+      "namespace": "Acme",
+      "visibility_level": 0,
+      "path_with_namespace": "acme/app",
+      "default_branch": "develop",
+      "ci_config_path": "",
+      "homepage": "https://gitlab.example.com/acme/app",
+      "url": "git@gitlab.example.com:acme/app.git",
+      "ssh_url": "git@gitlab.example.com:acme/app.git",
+      "http_url": "https://gitlab.example.com/acme/app.git"
+    },
+    "state": "opened",
+    "target": {
+      "id": 9,
+      "name": "app",
+      "description": "",
+      "web_url": "https://gitlab.example.com/acme/app",
+      "avatar_url": "[REDACTED]",
+      "git_ssh_url": "git@gitlab.example.com:acme/app.git",
+      "git_http_url": "https://gitlab.example.com/acme/app.git",
+      "namespace": "Acme",
+      "visibility_level": 0,
+      "path_with_namespace": "acme/app",
+      "default_branch": "develop",
+      "ci_config_path": "",
+      "homepage": "https://gitlab.example.com/acme/app",
+      "url": "git@gitlab.example.com:acme/app.git",
+      "ssh_url": "git@gitlab.example.com:acme/app.git",
+      "http_url": "https://gitlab.example.com/acme/app.git"
+    },
+    "time_change": 0,
+    "total_time_spent": 0,
+    "url": "https://gitlab.example.com/acme/app/-/merge_requests/737",
+    "work_in_progress": true,
+    "action": "update"
+  },
+  "labels": [],
+  "changes": {
+    "reviewers": {
+      "previous": [],
+      "current": [
+        {
+          "id": 62,
+          "name": "Claude",
+          "username": "project_9_bot_claude",
+          "avatar_url": "[REDACTED]",
+          "email": "[REDACTED]"
+        }
+      ]
+    }
+  },
+  "repository": {
+    "name": "app"
+  },
+  "assignees": [
+    {
+      "id": 31,
+      "name": "Daniel Kistner",
+      "username": "daniel",
+      "avatar_url": "[REDACTED]",
+      "email": "[REDACTED]"
+    }
+  ],
+  "reviewers": [
+    {
+      "id": 62,
+      "name": "Claude",
+      "username": "project_9_bot_claude",
+      "avatar_url": "[REDACTED]",
+      "email": "[REDACTED]"
+    }
+  ]
+}

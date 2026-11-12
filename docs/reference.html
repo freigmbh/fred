@@ -1,0 +1,1052 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI review service: reference</title>
+<style>
+:root { color-scheme: dark; }
+body { margin: 0; background: #000; color: #fff; font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; }
+main { max-width: 900px; margin: 0 auto; padding: 32px 20px 80px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 40px 0 10px; padding-top: 12px; border-top: 1px solid #222; }
+h3 { font-size: 15px; margin: 22px 0 6px; }
+p, li { max-width: 78ch; }
+ul, ol { padding-left: 22px; margin: 6px 0; }
+li { margin: 2px 0; }
+code { background: #111; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+pre { background: #0a0a0a; border: 1px solid #222; padding: 12px; overflow-x: auto; font-size: 13px; line-height: 1.45; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0 12px; font-size: 14px; }
+th, td { text-align: left; vertical-align: top; padding: 6px 10px; border-bottom: 1px solid #222; }
+th { color: #aaa; font-weight: 600; }
+.muted { color: #999; }
+a { color: #fff; }
+nav a { color: #bbb; text-decoration: none; margin-right: 14px; }
+nav a:hover { color: #fff; }
+pre.mermaid { background: #fff; border: 1px solid #ccc; border-radius: 4px; color: #111; padding: 16px; text-align: center; }
+pre.mermaid svg { max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<main>
+<h1>AI review service: reference</h1>
+<p class="muted">Reference. Describes the implemented contracts and runtime. For why, read <a href="architecture.html">architecture and decisions</a>. Reserved tables and later capabilities are marked explicitly.</p>
+
+<nav>
+<a href="#layout">Repo layout</a>
+<a href="#triggers">Triggers</a>
+<a href="#policy">Policy</a>
+<a href="#jobs">Jobs</a> <a href="#diagnostics">Diagnostics</a> <a href="#transcripts">Transcripts</a>
+<a href="#prompt">Prompt inputs</a>
+<a href="#findings">Findings</a>
+<a href="#finding-commands">Finding commands</a>
+<a href="#output">MR output</a>
+<a href="#instructions">Repo files</a>
+<a href="#projects">Projects</a>
+<a href="#models">Pipelines</a>
+<a href="#data">Data model</a>
+<a href="#docker">Docker</a>
+<a href="#spend-limits">Spend limits</a>
+<a href="#env">Environment</a>
+<a href="#glossary">Glossary</a>
+</nav>
+
+<h2 id="layout">Repo layout</h2>
+<pre><code>apps/controller/      Convex deployment: schema, webhook, policy, queue, crons
+apps/controller/convex/   Convex functions and schema.ts
+apps/worker/          Effect program on Node: claim, clone, two review stages, post, record
+apps/ui/              Static Vite app for the admin: queue health, jobs in flight, finished reviews, failures, spend
+packages/contracts/   zod schemas shared by controller and worker
+docs/                 HTML for people, Mermaid diagrams inline
+docker/               Docker stack: Dockerfile, compose.yaml, .env.example, nginx for the web image
+fixtures/             Webhooks and synthetic provider streams for offline tests
+.repos/               Gitignored. Upstream docs and sources agents pattern-match against
+AGENTS.md             Root agent file. One more per app where conventions differ</code></pre>
+<p>pnpm workspace. The worker imports the generated Convex API types from <code>apps/controller</code> and depends on <code>packages/contracts</code> for the finding and stage-output schemas.</p>
+
+<h2 id="triggers">Triggers</h2>
+<p>Each participating project has its own webhook from the same GitLab instance. All project webhooks use the same endpoint and secret and send merge request and comment events. Each project reviews through its own FRED bot: the bot user GitLab creates for the project's <code>0 FRED</code> <a href="#projects">project access token</a>. Only a connected project, one with a stored token and a review pipeline, can trigger a review. A group webhook sends the same payload, and the controller does not distinguish it from a project delivery.</p>
+<pre class="mermaid">
+graph TD
+  In["merge_request webhook"] --> Tok{"X-Gitlab-Token valid?"}
+  Tok -- no --> Rej["reject"]
+  Tok -- yes --> Conn{"project connected?"}
+  Conn -- no --> Ign
+  Conn -- yes --> Open{"action is open?"}
+  Open -- yes --> Assigned{"FRED bot in reviewers?"}
+  Assigned -- yes --> Bot
+  Assigned -- no --> Ign
+  Open -- no --> Act{"action is update?"}
+  Act -- no --> Ign["ignore"]
+  Act -- yes --> Rev{"FRED bot new in changes.reviewers, or re_requested?"}
+  Rev -- yes --> Dup
+  Rev -- no --> Push{"oldrev set and FRED bot in reviewers?"}
+  Push -- no --> Ign
+  Push -- yes --> Bot{"MR author is a bot user?"}
+  Bot -- yes --> Ign
+  Bot -- no --> Dup
+  Dup{"delivery replay or matching work outstanding?"} -- yes --> Ign
+  Dup -- no --> Existing{"same review exists?"}
+  Existing -- no --> Kind{"push?"}
+  Existing -- yes --> Retry{"fresh re-request, or reviewer addition after failure or denial?"}
+  Retry -- no --> Ign
+  Retry -- yes --> Kind
+  Kind -- yes --> Sup["supersede queued jobs for this MR and provider"] --> Pol["policy, then enqueue"]
+  Kind -- no --> Pol
+</pre>
+<table>
+<tr><th>Event</th><th>Detection</th><th>Result</th></tr>
+<tr><td>Project not connected</td><td>The project has no stored token or no review pipeline.</td><td>Ignored with <code>{"ignored":true,"reason":"project not connected to FRED"}</code> and diagnostic reason <code>unconfigured</code>. No project row, job, or comment.</td></tr>
+<tr><td>MR created with the FRED bot as reviewer</td><td><code>action: "open"</code> with the project's FRED bot user ID in top-level <code>reviewers</code>, unless the MR author is a bot. No <code>changes.reviewers</code> delta is required.</td><td>Emit <code>mr_opened</code>, including on drafts. Enqueue an initial review through policy and deduplication. Bot-authored MR creation is ignored; a human can add the reviewer later. Existing reviews at the same SHA are not retried or recovered.</td></tr>
+<tr><td>FRED bot added as reviewer</td><td><code>action: "update"</code> with <code>changes.reviewers</code>. The FRED bot user ID in <code>current</code> and not in <code>previous</code>.</td><td>Enqueue a new review, retry a denied review, or deliberately recover the latest failed review at the same SHA.</td></tr>
+<tr><td>Review re-requested</td><td>The FRED bot's reviewer entry with <code>re_requested: true</code>.</td><td>Enqueue or recover the review at the head SHA when no matching work is outstanding.</td></tr>
+<tr><td>Push while the FRED bot is assigned</td><td><code>action: "update"</code> with <code>oldrev</code> set and the FRED bot user ID in <code>reviewers</code>.</td><td>Cancel queued jobs for that MR and provider. Enqueue one job at the new head sha. Running analysis can finish; publication stops when its head is outdated.</td></tr>
+<tr><td>Finding command</td><td>A newly created MR comment containing one explicit <code>fred dismiss</code> or <code>fred undo</code> command.</td><td>Stores a receipt and acknowledges the webhook, then verifies the note and actor asynchronously before queuing a <a href="#finding-commands">finding command</a>. No review or model call.</td></tr>
+<tr><td>Other actions and unrelated updates</td><td>Reopen, close, merge, ordinary comment, thread resolved, label change, approval, and the retired Claude and Codex accounts as reviewers.</td><td>Ignored. Reopening with the FRED bot still assigned does not request another review. Resolving a GitLab thread does not change a finding's disposition.</td></tr>
+</table>
+<p>GitLab 18.0 sends <code>changes.reviewers</code> as <code>{ previous, current }</code> without <code>state</code> or <code>re_requested</code> on the entries. GitLab 19 sends <code>[previous, current]</code> with both. The controller parses both shapes. Re-request detection needs GitLab 19; on 18.0 a re-request is not a webhook event at all.</p>
+<p>The webhook reads the project's FRED bot through <code>projectTokens.identity</code>. <code>detectTrigger(event, botId, botAuthorIds)</code> returns at most one trigger per delivery, so one delivery creates at most one job. A bot-authored MR is one whose author is any FRED bot user of any project, including former bot users of replaced tokens, or a user in <code>BOT_USER_IDS_OTHER</code>. Such an MR triggers only when a human adds or re-requests the FRED bot.</p>
+<p>The review identity is <code>projectId + mrIid + headSha + provider</code>. Webhook delivery keys prevent duplicate deliveries from creating another attempt. A fresh deliberate re-request can create a new attempt at the same head SHA when no matching work is outstanding. Duplicate deliveries leave queued jobs unchanged, including replays of an older push. The budget owner for a job on a bot-authored MR is the user who added the reviewer.</p>
+
+<h2 id="policy">Policy</h2>
+<p>Evaluated at enqueue and again at claim. First match wins. Every denial posts one comment on the MR as the project's FRED bot.</p>
+<pre class="mermaid">
+graph LR
+  M{"FRED_MAINTENANCE_MODE is true?"} -- yes --> D0["deny: maintenance comment"]
+  M -- no --> A
+  A{"settings.globalEnabled?"} -- no --> D1["deny: disabled"]
+  A -- yes --> B{"developer blocked?"}
+  B -- yes --> D2["deny: blocked, reason"]
+  B -- no --> C{"project denies provider?"}
+  C -- yes --> D3["deny: provider not allowed"]
+  C -- no --> D{"month spend at or above budget?"}
+  D -- yes --> D4["deny: budget reached, amount and month"]
+  D -- no --> OK["allow"]
+</pre>
+<p>Maintenance mode applies to every provider and takes precedence over every other gate. Only the exact controller environment value <code>FRED_MAINTENANCE_MODE=true</code> enables it. An unset variable, <code>false</code>, or any other value leaves it off. New requests get a maintenance denial comment without a job. Queued analysis is denied at its next claim. Running analysis and saved publication continue. Clearing the flag does not restart denied work. A fresh review request passes through policy again. Delivery and review deduplication still apply.</p>
+<p>The budget is a developer's <code>budgets.monthlyUsd</code> override when present, otherwise <code>settings.defaultBudgetUsd</code>, 3000 by default. Optional developer blocks and project provider policies already participate in the gate. A <code>projectPolicies</code> row is keyed by project and provider, so a row for <code>fred</code> governs that project's reviews. Spend this month is the developer's <code>usageMonthly</code> row for the month, one document read through <code>by_developer_month</code>, converted from micro-dollars. <code>recordUsage</code> maintains that rollup in the same transaction as the ledger insert, so it equals the sum of <code>usageEvents.costUsd</code> for the developer and the month once <code>migrations.backfillUsageRollups</code> has run. The month is stored on each event as <code>yyyy-mm</code> in the org timezone at write time.</p>
+<p>A job that passes at enqueue and fails at claim is set to <code>denied</code> and gets the comment then.</p>
+<p>There is no per-review cost cap. A running review is never stopped for budget reasons.</p>
+
+<h2 id="jobs">Jobs</h2>
+<pre class="mermaid">
+stateDiagram-v2
+  queued --> running: new analysis, claim and policy passes
+  failed --> queued: deliberate recovery and policy passes
+  queued --> publishing: saved publication, fresh lease
+  queued --> denied: claim and policy fails
+  queued --> superseded: newer push
+  running --> publishing: save validated result
+  running --> failed: error, timeout, or expired lease
+  publishing --> publishing: expired lease reclaimed
+  publishing --> done: all effects acknowledged
+  publishing --> failed: permanent publication error
+  running --> superseded: outdated head detected
+  running --> skipped: no changes since the baseline
+  publishing --> superseded: outdated head or finding revision
+</pre>
+<table>
+<tr><th>Status</th><th>Meaning</th></tr>
+<tr><td><code>queued</code></td><td>Passed enqueue policy and waits for a claim. A deliberately recovered publication retains its saved result while queued.</td></tr>
+<tr><td><code>running</code></td><td>One worker owns a two-minute lease and performs analysis.</td></tr>
+<tr><td><code>publishing</code></td><td>Validated findings and immutable publication effects are stored. A new owner can resume after lease expiry.</td></tr>
+<tr><td><code>done</code></td><td>Every publication effect is acknowledged and finding decisions are applied.</td></tr>
+<tr><td><code>failed</code></td><td>Failure reason is stored and one failure comment is queued per failed lease generation.</td></tr>
+<tr><td><code>denied</code></td><td>Claim policy failed and one denial comment is queued.</td></tr>
+<tr><td><code>superseded</code></td><td>A newer push replaced queued work, or publication detected an outdated head or finding revision. Stored results and existing comments remain.</td></tr>
+<tr><td><code>skipped</code></td><td>The incremental comparison against the baseline was empty, so no model ran, nothing was posted, and no usage was recorded. The head still serves as the next baseline.</td></tr>
+</table>
+<p>Every public worker operation requires <code>workerSecret</code>, compared with <code>WORKER_SECRET</code> without early exit. Mutations for a claimed job also require its current <code>leaseToken</code>. The controller rejects expired or replaced owners. The review agent receives neither credential.</p>
+<p><code>jobs.claim</code> claims an eligible finding command before review work. Otherwise it chooses the oldest eligible queued review or recoverable publication. Running and publishing FRED reviews and commands share exclusion for the same project and MR. Work of the retired bots never holds an MR. Different MRs run concurrently, up to <code>WORKER_CONCURRENCY</code> per worker. Review claims compute <code>previousReviewedSha</code> from the latest completed or skipped review for that MR and provider. Claims and the queue subscription cover only provider <code>fred</code> and ignore a <code>providers</code> argument; queued work of the retired <code>claude</code> and <code>codex</code> bots stays unclaimed until <a href="#projects"><code>migrations:retireLegacyQueue</code></a> retires it.</p>
+<p>A claim returns the project's credential with the job: <code>gitlabBotUserId</code>, the bot user of the stored token; <code>gitlabBotUserIds</code>, every FRED bot user the project has had; and <code>gitlabToken</code>, the opened project access token. The claim is the only public function that returns a token, and it requires <code>workerSecret</code> and grants the lease in the same transaction. Queue and admin queries never return it. When the project has no token, or its sealed token cannot be opened, the claim fails the review with this reason and its failure comment, then moves to the next job:</p>
+<pre><code>FRED has no usable access token for this project. Connect the project in the FRED dashboard, then request the review again</code></pre>
+<p>A finding command in that state is marked failed with the same reason. Without a usable token the failure comment cannot be delivered either, so it is recorded as <code>note_failed</code>.</p>
+<p>The queue subscription includes running and publishing lease expiry times so a restarted worker wakes when abandoned ownership expires. The worker renews its two-minute lease every 30 seconds, and again before each publication effect. Lost analysis expires as <code>failed</code> with reason <code>stale</code>. Remove/re-add starts both analysis stages in a new attempt. Lost publication remains recoverable. A reclaimed publication receives a new lease and resumes its stored effects without model calls.</p>
+<p>The claim loop wakes at startup, on queue subscription errors, when a job finishes, at lease expiry, and when the WebSocket changes from disconnected to connected. A queue subscription update wakes it only when the update contains a queued review or command or an expired lease. Every update reschedules the lease-expiry wake, so an update that only renews a lease through a heartbeat does not claim. Other connection state changes, such as in-flight request counts or retry counts, do not wake the loop. A failed claim schedules a retry after ten seconds.</p>
+<p>SIGTERM and SIGINT stop new claims and let active reviews finish before the worker exits. An in-flight claim is still completed and processed. The deployment service allows up to two hours for shutdown before systemd terminates the process.</p>
+<p>Each model stage has a 45-minute timeout. There is no model-call or tool-call count limit. Checkout has a separate five-minute operational timeout. <code>max_turns</code> remains readable on historical rows but is not emitted by the worker.</p>
+<p>Controller connection loss pauses claims and publication. The worker keeps running and allows a bounded reconnect window of 15 seconds before interrupting analysis. Essential job RPCs wait up to 15 seconds for the same in-flight request. Owned publication and heartbeat waits end at least one second before the last confirmed lease expiry. Timeouts do not cancel Convex mutations or create replacement requests. Claims retain their pending request until it settles so a granted lease is not abandoned. The worker attempts to record interrupted analysis within another bounded RPC wait; lease cleanup records abandoned analysis if that attempt fails. Confirmed lease loss stops the old owner without a failure write. Tagged application rejection fails immediately. Settled untagged errors receive at most two retries after 100 and 200 milliseconds within the original wait budget; exhaustion fails the job. Best-effort diagnostics do not retry settled errors. A single-host deployment shares one clock between worker and controller; owned-call budgets assume synchronized clocks. After a controller timeout, ambiguous save responses leave stored publication recoverable. Stored publication resumes under a valid lease.</p>
+<table>
+<tr><th>Operation</th><th>Contract</th></tr>
+<tr><td><code>jobs.saveResult</code></td><td>Validates and stores all findings, finding decisions, and immutable publication effects before the first GitLab write. Records the current finding revision and moves the job to <code>publishing</code>.</td></tr>
+<tr><td><code>jobs.ackPublication</code></td><td>Acknowledges effects in stored order. Repeated identical acknowledgements are idempotent. Summary acknowledgement marks accepted findings posted and records the summary note ID. Inline acknowledgement records discussion and note IDs. These delivery updates preserve disposition. A <code>resolve</code> acknowledgement applies its explicit validator decision and appends the audit row.</td></tr>
+<tr><td><code>jobs.complete</code></td><td>Requires every effect acknowledged. Applies remaining summary-only finding decisions and marks the job done. Already applied decisions are idempotent.</td></tr>
+<tr><td><code>jobs.fail</code></td><td>Preserves stored results, records the failure, and queues its comment.</td></tr>
+<tr><td><code>jobs.interruptAnalysis</code></td><td>Fails interrupted analysis. Leaves stored publication recoverable. Interrupted analysis records an accounting gap.</td></tr>
+<tr><td><code>jobs.supersede</code></td><td>Stops publication with an outdated head or finding revision while retaining stored findings and acknowledgements.</td></tr>
+<tr><td><code>jobs.skip</code></td><td>Ends running analysis whose incremental comparison was empty. Answers <code>skipped: false</code> and leaves the job running when a published open finding came from a review that never completed, because only a completed review validated its findings against the baseline tree. Rejects a job that already saved a result.</td></tr>
+</table>
+<p>Validator decisions identify earlier findings from the same project, MR, and provider and carry the expected current decision ID. New decisions require a published, open finding. Invalid ownership or a changed decision rejects the result before publication. Historical fixed rows remain readable for recovery of legacy results.</p>
+<p>A saved review's <code>findingRevision</code> identifies the latest decision for its MR and provider. The worker checks this revision before publication. The controller rejects stale resolution and label acknowledgements and stale completion. A newer decision prevents replay of obsolete resolution or label effects. Recovery reconciles an uncertain summary by marker and bot author before superseding the review. Decisions applied by the review advance its saved revision.</p>
+<p><code>readReviewResult</code> validates historical results containing <code>resolvedFindingIds</code> and decodes them as fixed decisions. It preserves the stored JSON, publication bodies, effect keys, and acknowledgements. It does not rewrite historical results.</p>
+
+<p>Stale cleanup and claim-time expiry read at most 32 expired jobs per status through lease-expiry indexes, including legacy analysis deadlines. Healthy running jobs are outside those reads.</p>
+<p>A fresh reviewer-add delivery can retry the latest failed or denied attempt at the same SHA. Failed or denied analysis creates a new job, preserving the earlier attempt. Failed publication queues the original job with its immutable result and acknowledgements, immediately revokes the old lease, and receives fresh ownership at claim. Enqueue policy applies before deliberate recovery, using the original budget owner for saved publication. Saved publication does not repeat analysis policy at claim, matching automatic publication recovery. All work on one MR still serializes.</p>
+<p>A matching queued, running, or publishing attempt suppresses both reviewer-add and re-request duplicates. A fresh native re-request can rerun a completed review. Remove/re-add only bypasses same-SHA deduplication after failure or denial. Webhook delivery replay remains idempotent after failure and after policy changes. Publication verifies the current MR head before each effect and supersedes obsolete results.</p>
+
+<h3>Comment delivery</h3>
+<p>Denials and failures create an <code>mrNotes</code> row in the same transaction as their policy or job update. A failure uses job ID and lease generation as the delivery key. Its note row retains job association and the validated compact failure snapshot after recovery. Other job notes use the job ID. An enqueue denial uses project, MR, head SHA, provider, and denial reason. A finding command rejection uses project and note ID, a finding command failure adds its lease generation, and a verification failure uses the receipt ID. Repeated scheduling of a key creates no second delivery. <code>noteKeys.ts</code> builds every key.</p>
+<table>
+<tr><th>Status</th><th>Meaning</th></tr>
+<tr><td><code>pending</code></td><td>Scheduled for its first attempt or a retry.</td></tr>
+<tr><td><code>sent</code></td><td>GitLab accepted the POST, or a retry found its marker in an existing note.</td></tr>
+<tr><td><code>failed</code></td><td>Permanent error or all five attempts exhausted. <code>lastError</code> records the cause.</td></tr>
+</table>
+<p>Every note posts as the project's FRED bot through its stored token, including notes about jobs of the retired bots. Network errors, HTTP 408, HTTP 429, and HTTP 5xx retry after 5, 30, 120, and 300 seconds. Each HTTP request has a 10-second timeout and rejects redirects, so the token never leaves <code>GITLAB_URL</code>. Other HTTP errors, invalid configuration, and a project that is not connected fail without retry; the last records <code>GitLab configuration invalid or project not connected</code>. Before each delivery attempt, the controller searches all MR notes pages for the hidden <code>fred-note</code> marker. A match prevents another POST when the previous response was lost. The internal <code>mrNotes.retryFailed</code> mutation restarts a failed delivery with its original marker and resets the attempt count. This does not provide an atomic transaction with GitLab or recovery from a controller process crash during delivery.</p>
+
+<h3 id="admin-queries">Admin API</h3>
+<p>Queries, the project writes, the transcript switch and download, and the data export serve the admin UI. Every call takes <code>adminSecret</code> and compares it with <code>ADMIN_SECRET</code> without early exit. A wrong secret is <code>unauthorized</code>. The secret grants no worker access. <a href="#projects">Projects and tokens</a> describes <code>admin.projects</code> and the writes that connect, check, and disconnect projects and save their pipelines. <a href="#models">Review pipelines</a> describes <code>admin.refreshModels</code>.</p>
+<table>
+<tr><th>Query</th><th>Contract</th></tr>
+<tr><td>Budget owner names</td><td>Queue, failures, and spend return the stored <code>displayName</code>, or <code>null</code>. The UI shows this GitLab full name, falling back to the username, then the numeric GitLab user ID. Review-trigger webhooks update the name only when the triggering user is the budget owner. Names are trimmed; a blank name clears the stored name, and a missing name preserves it. Existing developers use their stored username or ID until a matching webhook supplies their full name.</td></tr>
+<tr><td><code>admin.overview</code></td><td>Queue counts per status and the oldest queued time, the global and maintenance flags, the last seven days of failures split into failed, denied at claim, note failed, and enqueue-time denials per gate, and this month's outcomes for each of <code>fred</code>, <code>claude</code>, and <code>codex</code>: done count, clean label count, findings by severity without duplicates, validator rejects, and claim and run latency as median and worst. Outcomes come from <code>reviewOutcomes</code>, never from the done jobs themselves, so the query stays within Convex's read limits as the month fills.</td></tr>
+<tr><td><code>admin.queue</code></td><td>Every job with status <code>queued</code>, <code>running</code>, or <code>publishing</code>, grouped in that order and oldest first inside each stage by claim time, or creation time while queued. Each row joins project path, budget owner, head SHA, the previous reviewed SHA once claimed, worker, lease generation, lease expiry, the merged diagnostic snapshot's phase, last activity, and model, publication progress as acknowledged effects against saved effects, findings by severity with status <code>pending</code> or <code>posted</code> while publishing, and spend so far from <code>usageEvents</code>. Also returns <code>now</code> as in <code>admin.overview</code> and <code>gitlabUrl</code> as in <code>admin.failures</code>.</td></tr>
+<tr><td><code>admin.reviews</code></td><td>Finished jobs newest first by end time: <code>completedAt</code>, or creation time for a claim-time denial, which never completes. Filtered by <code>since</code>, <code>statuses</code> as any subset of <code>done</code>, <code>failed</code>, <code>denied</code>, <code>superseded</code>, and <code>skipped</code>, defaulting to all five, <code>provider</code>, and <code>models</code>, matching a job when any stage selection or ledger row used one of the listed model IDs, alias prefix removed. <code>limit</code> is at most 200 and bounds both the page and the scan: each requested status contributes its newest <code>limit</code> jobs in the window, read through <code>by_status_completed</code>, plus its newest <code>limit</code> jobs without <code>completedAt</code>, meaning denials at claim and queued jobs superseded by a push, which sit outside any <code>completedAt</code> range and take the window by creation time. The provider and model filters apply afterwards. <code>hasMore</code> is true when matches were cut or any status scan hit its cap. Each row joins project path, budget owner, head SHA, the previous reviewed SHA, the stage selections, every model that touched the job, the verdict from the saved label effect, finding counts by severity with validator rejects and duplicates apart, failure reason, the MR comment text, worker, lease generation, the <code>fredVersion</code> that saved the result, usage flags, and spend from <code>usageEvents</code>. <code>models</code> lists every model seen in the scanned window before the model filter, for the filter itself. Also returns <code>now</code> and <code>gitlabUrl</code>.</td></tr>
+<tr><td><code>admin.reviewStats</code></td><td>Totals for the Reviews page over every finished job <code>admin.reviews</code> would list for the same <code>since</code>, <code>statuses</code>, and <code>provider</code>, without its <code>limit</code>, so the totals do not change when the page loads more rows. Returns <code>reviews</code>, <code>done</code>, <code>failed</code>, <code>clean</code>, <code>findings</code> as blocking, should fix, and nit together, without validator rejects and duplicates like the table, the median run time <code>runP50Ms</code>, and <code>costUsd</code> from <code>usageEvents</code>. Done jobs are counted from their <code>reviewOutcomes</code> rows, and the other statuses from <code>reviewJobs</code> through <code>by_status_completed</code>. It has no model filter, so the page hides the totals while the model filter or the search box narrows the table.</td></tr>
+<tr><td><code>admin.review</code></td><td>One job by ID for the expanded row, or <code>null</code>: the saved summary body, every stored finding with its status, disposition, and reject reason, the ledger rows per stage, usage confirmation, the merged diagnostic snapshot's phase and failure with its detail, publication progress, the job's <code>collectTranscripts</code> flag, and its <a href="#transcripts">transcript</a> rows: stage, lease generation, outcome, model, effort, gzipped bytes, turns, tool calls, duration, record time, <code>available</code>, and <code>omitted</code>. Storage IDs are not returned.</td></tr>
+<tr><td><code>admin.downloadTranscript</code></td><td>Action taking <code>adminSecret</code> and <code>transcriptId</code>. Returns the gzipped file bytes and the file name <code>fred-&lt;jobId&gt;-&lt;stage&gt;-g&lt;leaseGeneration&gt;.json.gz</code>.</td></tr>
+<tr><td><code>admin.exportManifest</code></td><td>Returns <code>{ formatVersion: "fred-export/1", tables }</code>: the names of the <a href="#glossary">data export</a>'s tables in schema order. Every table except <code>webhookDeliveries</code>, which holds only delivery dedupe keys. A table added to the schema does not compile until <code>dataExport.ts</code> decides whether it is exported.</td></tr>
+<tr><td><code>admin.exportPage</code></td><td>Takes <code>table</code>, one of the manifest's names, and <code>cursor</code>, <code>null</code> for the first page. Returns <code>{ rows, continueCursor, isDone }</code> in creation order; pass <code>continueCursor</code> back until <code>isDone</code>. Rows are the stored documents with <code>_id</code> and <code>_creationTime</code>, without secrets and storage IDs: <code>projectTokens.sealedToken</code>, <code>reviewJobs.leaseToken</code>, <code>findingCommands.leaseToken</code>, and <code>transcripts.storageId</code>, which becomes <code>available</code> as in <code>admin.review</code>. Pages hold 200 rows only for tables whose every field is bounded: numbers, IDs, enums, short keys, or strings the code caps. Every table with uncapped free text holds 10 rows, so a page stays under 10 MiB at the 1 MiB document limit: <code>modelCatalog</code>, <code>developers</code>, <code>projectTokens</code>, <code>reviewJobs</code>, <code>diagnosticSnapshots</code>, <code>reviewFailures</code>, <code>findings</code>, <code>findingDecisions</code>, <code>findingCommandRequests</code>, <code>findingCommands</code>, <code>mrNotes</code>, and <code>policyAudit</code>. Each page is a separate read, so the export is not a point-in-time snapshot.</td></tr>
+<tr><td><code>admin.failures</code></td><td>Newest <code>reviewFailures</code> first, at most 100 per page, filtered by <code>since</code>, <code>before</code>, and <code>kind</code>. Pass the returned <code>nextCursor</code> as <code>cursor</code> with unchanged filters to continue, including rows that share a timestamp. <code>hasMore</code> means another page may exist. A full final page can return true, followed by an empty page. Stop when <code>hasMore</code> is false; <code>nextCursor</code> is then null. <code>before</code> is an exclusive time filter, not a pagination cursor. Kind filtering uses <code>by_kind_at</code>. Each row joins project path, budget owner, spend so far from <code>usageEvents</code>, and the durable detail: head SHA, current job status, worker, lease generation, usage flags, phase, active model and effort, saved detection and validation selections, failure classification, and failure comment status. The result also includes <code>gitlabUrl</code>, the controller's <code>GITLAB_URL</code> with its trailing slash removed, or <code>null</code> when it is unset or carries credentials, a query, or a fragment, for MR links.</td></tr>
+<tr><td><code>admin.spend</code></td><td>Reads the rollups, never the ledger: <code>usageDaily</code> for the month's days and <code>usageMonthly</code> for the budget owner table. One <code>yyyy-mm</code> month in the org timezone, with month number 01 through 12, carries the headline, the chart, and the tables: total, per lab with reviews and token totals, per day per lab, working days Monday to Friday with the elapsed count, cost per elapsed working day and its projection, per model with its lab across all bots, and per budget owner with budget, override flag, review count, blocked state, and incomplete usage count. A review counts once, in the day and month of its first priced usage row. Incomplete jobs are flagged jobs created in that org-local month or whose first priced row fell in it, found through <code>by_usage_incomplete</code> over the UTC month padded by two days each side, even with no usage rows; a flagged job that waited in the queue for more than a day across a month boundary counts only in its creation month. Their developers appear with zero recorded cost when necessary. Defaults to the current month.</td></tr>
+</table>
+
+<h2 id="diagnostics">Maintenance diagnostics</h2>
+<p>The shared schemas in <code>packages/contracts/src/diagnostics.ts</code> define diagnostic events, failure classifications, and compact job snapshots. Every job uses the same worker recorder. Worker snapshots live in <code>diagnosticSnapshots</code>, separate from lifecycle-owned <code>reviewJobs.diagnosticJson</code>. Lifecycle operations do not read worker snapshots. Legacy job snapshots remain readable. Failures carry their validated snapshot directly into the terminal mutation and durable failure note.</p>
+<pre class="mermaid">graph LR
+  H[Webhook and controller] --> E[(Diagnostic events, seven days)]
+  W[Worker recorder] --> E
+  W --> S[(Compact job snapshot and failure detail)]
+  W --> J[Worker journal: every event and failure trace]
+  A[Operator or maintenance agent] --> P[Deployment host]
+  P --> J
+  P --> Q[diagnostics:inspect through the controller's Convex CLI]
+  Q --> E
+  Q --> S
+  P --> M[Services, Convex and nginx logs, host state]</pre>
+<table>
+<tr><th>Evidence</th><th>Recorded metadata</th></tr>
+<tr><td>Webhook and queue</td><td>Receipt, unsupported or invalid event, authentication rejection, project not connected, no trigger, duplicate delivery or review, policy gate, queue, claim, supersession, and expiry. Maintenance denials record <code>reason: "maintenance"</code> in the shared diagnostic event schema. A delivery or enqueue for a project that is not connected records <code>reason: "unconfigured"</code>. Jobs superseded by <code>migrations:retireLegacyQueue</code> record <code>reason: "retired_bot"</code>. Unauthenticated or invalid payloads have no trusted MR identity. A retained receipt proves receipt for the MR, not a causal link to a particular job.</td></tr>
+<tr><td>Review progress</td><td>Context, checkout, instructions, detect, validate, save, and publish phase transitions; duration; last observed provider activity. Provider activity events are coalesced over ten seconds while the compact snapshot keeps the latest observed activity time. <code>tool_started</code> and <code>tool_completed</code>, with tool name, duration, and outcome, go to the worker journal only; they still advance the snapshot's <code>lastActivityAt</code>.</td></tr>
+<tr><td>Provider failure</td><td>Classified error category, recognized error code when available, and HTTP status. Allowlisted OpenRouter metadata distinguishes <code>string_too_long</code>, <code>context_length_exceeded</code>, and <code>payload_too_large</code>, including error bodies returned with HTTP 200. Request failures carry local measurements of serialized HTTP body bytes, message count, and the largest serialized message in UTF-16 characters. These measurements include wire metadata and are not token counts. The initial prompt guard has a separate <code>review_input_too_large</code> code. OpenRouter output failures distinguish invalid JSON, mixed submission calls, and schema mismatches. Schema diagnostics contain at most eight issue codes and bounded paths made only of known contract field names and array indexes. The write schemas accept only this OpenRouter metadata. Historical native-runtime source, code, RPC, process, and proxy metadata stays readable through the stored schemas <code>storedDiagnosticEvent</code> and <code>storedDiagnosticSnapshot</code>, which the controller uses for every stored row. The upstream error message and metadata appear only in the failure detail.</td></tr>
+<tr><td>Failure detail</td><td>Every classified failure carries <code>detail</code>: its cause chain, outermost first, one cause per line. Each line holds the error tag or name and message, the HTTP status, and up to 500 characters each of the upstream fields: response <code>body</code>, git <code>stderr</code>, model <code>output</code>, and error <code>metadata</code>. Each field is redacted whole before it is bounded. Upstream fields never enter error messages, so classification reads only FRED's own text. Git failures name the subcommand and exit status or signal, with stderr. GitLab HTTP failures name the method, API path without query, and status, with the response body; invalid responses carry the schema mismatch as body. An OpenRouter response without a complete review tool call is classified <code>provider</code> and names the finish reason, tool call count, and served model, with the refusal and assistant text as output. Detail is bounded to 2,000 characters. <code>redactSecrets</code> in <code>packages/contracts/src/redaction.ts</code> replaces values of at least eight characters held by environment variables named with <code>SECRET</code>, <code>TOKEN</code>, <code>KEY</code>, <code>PASSWORD</code>, or <code>CREDENTIAL</code>. The worker adds the claimed project access token to those values, so failure detail and traces redact it although it is not in the worker environment. It also replaces credential shapes: GitLab tokens, <code>sk-</code> API keys, JWTs, Convex admin keys, URL userinfo, <code>Bearer</code> and <code>Basic</code> values, and credential assignments. Detail can contain repository paths, model output, and upstream error text. <code>failureSummary</code> never includes it, so MR comments keep the classified text.</td></tr>
+<tr><td>Publication</td><td>Effect kind and index, attempt, acknowledgment, duration, saved effect count, acknowledged count, and denial or failure note delivery status, attempt count, and last delivery error.</td></tr>
+<tr><td>Diff recovery failure</td><td>GitLab category with <code>diff_recovery_failed</code> for an unverifiable MR file inventory or rejected raw patch data, including unsupported, malformed, ambiguous, or incomplete hunk-less sections. Verified hunk-less sections and verified split rename halves do not fail. The safe MR comment states that complete review input could not be verified. HTTP failures retain the GitLab request classification and HTTP status. The failure detail names the failed check and affected paths; raw patches are excluded.</td></tr>
+<tr><td>Correlation</td><td>Job ID, GitLab project and MR, head SHA, provider, lease generation, active stage model and effort, runtime version, and deployed release SHA when available.</td></tr>
+</table>
+<p><code>diagnosticSnapshots</code> holds each job’s worker snapshot: phase, timestamps, failure classification and detail, release, active stage model and effort, lease generation, and dropped-event count. Stored snapshots are bounded to 16,384 characters. The model and effort remain available after that stage completes. Job reports also include saved detection and validation selections with valid diagnostic model identifiers and recognized effort values, including models no longer in the catalog. The job’s <code>diagnosticJson</code> holds lifecycle outcomes and legacy snapshots. Reports combine both by lease generation; lifecycle mutations never read the worker snapshot. Compact snapshots remain with the job. A newer phase cannot erase an already recorded failure in the same lease generation. An expired or replaced owner cannot repair its diagnostics. Publication recovery starts a new lease generation.</p>
+<p><code>diagnosticEvents</code> holds validated metadata with <code>recordedAt</code> and <code>expiresAt</code>. Queries exclude events after seven days. A minute cron removes up to 500 expired rows per run, so physical deletion can lag during outages or a backlog. Findings, usage rows, publication records, and compact job outcomes do not expire with diagnostic events.</p>
+<p>The worker buffers at most 128 events per job and flushes every ten seconds and once when the job ends. A flush sends batches of at most 25 in order until the buffer is empty or a batch fails. Each batch waits at most one second. Without buffered events, a flush sends the snapshot alone only when its dropped-event count changed, or when <code>lastActivityAt</code> moved and the previous send is at least a minute old; the final flush sends any moved activity. The stored <code>lastActivityAt</code> can therefore trail observed activity by about 70 seconds. One underlying diagnostic mutation can remain pending across all reviews in a worker; another starts only after that request settles. A periodic flush that finds this slot busy sends nothing and keeps its batch for the next flush. Overflow, failed or timed-out writes, and a final flush that finds the slot busy drop events from the controller. A final flush that stops at a failed batch also drops every event still buffered; the snapshot records observed drops. Controller recording is best-effort. Diagnostic failure does not fail a review; required accounting and publication writes retain their existing behavior.</p>
+<p>The worker journal is the complete local timeline. Each diagnostic event is one JSON line, <code>{"fredDiagnostic":1, jobId, gitlabProjectId, mrIid, headSha, provider, leaseGeneration, event}</code>, written whether or not the controller accepts it, including tool events the controller never receives. Controller events keep their journal <code>sequence</code>, so tool events leave gaps there. Each job failure or interruption adds one <code>{"fredFailure":1, …correlation, at, outcome, phase, failure, trace}</code> line. Finding command failures write the same line with <code>commandId</code>. A worker stopped by a runtime failure writes <code>{"fredRuntimeFailure":1, at, failure, trace}</code> to stderr. Each job failure also logs one readable warning: <code>Review &lt;job&gt; failed in &lt;phase&gt;: &lt;summary&gt; [&lt;first cause&gt;]</code>. Prompts, tool arguments and results, findings, and transcripts are not journaled. With <a href="#transcripts">transcript collection</a> on, transcripts are stored redacted in Convex file storage instead; they never enter the journal or diagnostics.</p>
+<table>
+<tr><th>Interface</th><th>Contract</th></tr>
+<tr><td><code>diagnostics.record</code></td><td>Worker-authenticated, lease-fenced metadata writes. Accepts up to 25 schema-validated events plus an optional snapshot, bounded to 131,072 characters. Updates the separate worker snapshot without modifying the job document. The same terminal owner can flush after its own completion or failure; a stale or replaced owner cannot write.</td></tr>
+<tr><td><code>diagnostics.inspect</code></td><td>Internal query, callable only with the deployment admin key, across all handled projects. Selects a job, a project and MR, or recent records, optionally by provider. A supplied empty project selector never falls back to recent records. Returns jobs with failure reason and comment text, usage totals and gaps, publication acknowledgments against the saved effect count, with <code>resultUnreadable</code> when the saved result no longer parses, merged snapshot, and their <code>reviewFailures</code> rows; events; notes with body, status, attempts, last delivery error, and failure snapshot; and coverage flags. Lease tokens and saved result JSON are excluded.</td></tr>
+<tr><td>Query bounds</td><td>At most 20 jobs and notes, 1,000 diagnostic events, and 200 usage rows and 20 failure rows per job. Provider filtering operates within the bounded scan. Truncation, invalid events, missing receipts, and empty results are explicit. Usage sums include recorded correction rows and are marked when corrections exist; they are not an invoice.</td></tr>
+</table>
+<p>A one-second wait per batch bounds caller latency; the transport slot remains occupied until the mutation settles. The latest snapshot stays in the recorder. Final failures use the essential lifecycle operation and the journal. Terminal provider errors enter the recorder and journal before the stage releases its resources. Their structured details travel with the error into the terminal job mutation after cleanup. Resource cleanup cannot replace those details.</p>
+<p>Controller failure metadata includes an allowlisted operation name, <code>timeout</code>, <code>disconnected</code>, <code>rejected</code>, or <code>lease_lost</code>, elapsed milliseconds, and WebSocket connection state. A connected socket does not establish job ownership. The failure detail adds the underlying Convex error message; request arguments are excluded.</p>
+<p>Failure comments contain the classified summary and job ID, never the failure detail. The admin UI shows the detail with each failure and finished review. A healthy worker heartbeat is not proof of provider progress. No recorded usage does not prove that no API call occurred. Missing diagnostic evidence does not prove that GitLab never sent a request. See <a href="run-locally.html#investigate">investigate a review</a> for the operator workflow.</p>
+
+<h2 id="transcripts">Transcripts</h2>
+<p>Transcript collection is off by default and switched per project in <code>projects.collectTranscripts</code>. Enqueue copies it onto a new job as <code>reviewJobs.collectTranscripts</code>, like <code>stageModels</code>, and writes the field only when true. The worker reads only the job snapshot, so a switch affects newly queued reviews. Recovery of a saved publication keeps its job unchanged and makes no model call. Both bot identities collect alike.</p>
+<p>A collecting job stores one transcript per stage exit: <code>completed</code>, <code>failed</code>, <code>timed_out</code> at the 45-minute deadline, or <code>interrupted</code>. Job, lease generation, and stage identify it, so a retried job keeps every attempt. A stage that ends before its first model request stores nothing. The worker stores the transcript before it reports the stage's failure or interruption, while its lease is still valid.</p>
+<pre><code>{ format: "fred-transcript/1", jobId, provider, stage, leaseGeneration, model, effort, outcome,
+  release?, fredVersion?, reviewRulesSha?, startedAt, endedAt, tools, messages, turns }</code></pre>
+<p>The file is gzipped JSON in Convex file storage. <code>provider</code> is the bot identity. <code>tools</code> holds the offered tool definitions. <code>messages</code> holds the system prompt, the initial user message, every assistant message with its reasoning fields when the model returns them, every tool result, and, for a completed stage, the final <code>submit_review</code> call. <code>turns</code> holds one entry per HTTP response: <code>at</code>, <code>latencyMs</code>, <code>httpStatus</code>, and when present OpenRouter's <code>generationId</code>, the served <code>model</code>, the routed upstream <code>provider</code>, <code>finishReason</code>, and <code>usage</code>. <code>release</code> is <code>FRED_RELEASE_SHA</code> and <code>fredVersion</code> is <code>FRED_VERSION</code>. <code>reviewRulesSha</code> is the SHA-256 hex of the review rules in the prompt, root <code>REVIEW.md</code> or FRED's defaults. All three also appear on the row.</p>
+<p>Before compression, <code>redactSecrets</code> replaces secrets in every string value, the same rule as <a href="#diagnostics">failure detail</a>. The file and row carry no developer ID, username, trigger, or MR author; <code>jobId</code> joins them to findings, usage, and decisions. Prompt text still contains discussion authors as GitLab shows them, and the file contains the source code, diffs, and discussions the agent read.</p>
+<p>Storing is best-effort. The call uses the job's lease-bounded controller budget. A failed store logs one worker warning and never fails the review. A collecting job without a transcript for a stage is the visible gap. Transcripts remain until deleted and do not expire with diagnostic events. Deletion leaves findings, usage, and decisions intact.</p>
+<table>
+<tr><th>Interface</th><th>Contract</th></tr>
+<tr><td><code>transcripts.store</code></td><td>Worker-authenticated, lease-fenced action, controller operation <code>transcripts:store</code>. Takes the stage metadata and the gzipped file as bytes, at most 8 MiB. A larger transcript sends no file and records <code>omitted: "too_large"</code> with zero bytes. Rejects a lost lease with <code>lease_lost</code> and a job without <code>collectTranscripts</code>. Stores the blob, then inserts the row under the job's lease generation. A repeated store for the same job, lease generation, and stage keeps the first row and deletes the new blob. A failed insert deletes its blob.</td></tr>
+<tr><td><code>admin.downloadTranscript</code></td><td>See the <a href="#admin-queries">admin API</a>. File storage URLs are never returned, because they require no credential and the files contain source code.</td></tr>
+<tr><td><code>admin.setTranscriptCollection</code></td><td>Admin mutation behind the Projects page switch. <code>{ projectId, enabled }</code> sets <code>projects.collectTranscripts</code> and appends a <code>policyAudit</code> row with actor <code>admin</code>. An unknown project rejects with <code>project_not_found</code>.</td></tr>
+<tr><td><code>transcripts:setCollection</code></td><td>Internal mutation, callable only with the deployment admin key. <code>{ projectPath, enabled }</code> sets <code>projects.collectTranscripts</code> and appends a <code>policyAudit</code> row with actor <code>dashboard</code>.</td></tr>
+<tr><td><code>transcripts:deleteForJob</code>, <code>transcripts:deleteForMr</code></td><td>Internal mutations taking <code>{ jobId }</code> or <code>{ projectPath, mrIid }</code>. Delete the matching files and rows and append a <code>policyAudit</code> row.</td></tr>
+</table>
+
+<h2 id="prompt">Prompt inputs</h2>
+<p>Both stages receive the same project rules, checkout, review scope, and MR context. Stage 2 also receives the candidates. The provider exposes controlled checkout reads, searches, file discovery, and skill discovery and loading. Harmless runtime utilities may remain available. Shell execution, writes, external network tools, host files outside the checkout, and worker credentials are unavailable.</p>
+<table>
+<tr><th>Input</th><th>Source</th></tr>
+<tr><td>Checkout at the exact head SHA</td><td>Scoped shallow Git fetch. The worker verifies the SHA, removes Git metadata, and deletes the directory on every exit.</td></tr>
+<tr><td>Changes since the provider's last completed review</td><td>GitLab MR diff versions API, then the compare API. The baseline's diff version must record the same merge base as the current head; a rebase or target merge moves it, and the review covers the full MR with a hint instead of treating target branch commits as review scope. GitLab's empty diff versions record no merge base and never serve as the baseline. An unavailable baseline or incomplete comparison also falls back to the complete MR diff with a hint. An empty comparison skips the review without model calls. A deliberate re-request at the already reviewed head reviews the full MR again.</td></tr>
+<tr><td>Full MR diff</td><td>Paginated GitLab MR diffs API. Omitted or truncated patches trigger recovery from <code>raw_diffs</code>. Recovery requires unambiguous coverage of every regular API file, matching patch paths, complete text hunks, and a final newline. A complete regular API rename can match one raw rename section or exactly one full deletion and one full addition with matching paths and the respective deleted or new file mode line. The old and new modes may differ. Every mode line and index mode suffix, in halves and hunk-less sections alike, must carry a Git tree-entry mode (<code>100644</code>, <code>100755</code>, <code>120000</code>, <code>160000</code>); other values fail recovery. Text halves require complete whole-file hunks. Empty halves require the Git empty-blob ID and an absent opposite side. Binary halves require an index with an absent opposite side and an exact path-matched binary marker. A complete regular rename patch and its inline coordinates remain unchanged. When the regular rename patch is omitted, both verified halves stand in as review context for the model, with a summary hint; findings for that file appear in the summary only and never inline. An omitted regular patch whose raw section has no text hunks is accepted only as one complete Git metadata shape that agrees with the API flags and paths: an unchanged rename at 100% similarity with optional mode change, an empty file addition or deletion with the empty-blob ID, a mode-only change between regular file modes, or a binary addition, deletion, modification, or changed rename with an exact path-matched binary marker. The verified metadata is rendered to the model in place of a patch and carries no inline anchors. Copies, binary patch payloads, and every other sequence fail recovery. Mixed representations and duplicate or missing sections fail recovery. Capped file counts use the tree-verified recovery described below. Incomplete pagination and incomplete recovery fail the review. Head, state, and diff references are checked again after loading. Adapter errors name the failed check and affected paths. Safe diagnostics and MR comments distinguish diff recovery failures from HTTP failures. Paths use JSON escapes inside inline code so filenames cannot introduce new lines, Markdown, or GitLab quick actions. The diff catalog retains this verified data for both stages. Full-MR context never expands incremental review scope.</td></tr>
+<tr><td>Diff catalog</td><td>One job-local catalog assigns stable IDs to pairs of old and new paths across the full and incremental diffs. Its manifest retains every entry, change kind, available scope and full ranges, text sizes, line counts, and inline-anchor eligibility. When the manifest cannot fit inline, the prompt directs both stages to read the complete catalog through bounded <code>list_diffs</code> pages before selecting patches. The manifest writes unchanged paths once and combines identical range metadata as <code>scopeAndFull</code>. Scope-only files remain available even when absent from the full MR. Equal scope and full text with the same anchor eligibility shares one inline section. Small patches of at most 12 KiB are inlined while the prompt budget permits, with scope ranges first. Every other range remains available through <code>read_diff</code>. One stable summary hint reports that diff ranges were offered on demand; it does not claim that the model read them.</td></tr>
+<tr><td>MR title and description</td><td>Current GitLab MR API response.</td></tr>
+<tr><td>All discussions with authors, replies, and resolution state</td><td>Every page of the GitLab discussions API. Publication uses the complete list. The stage prompt omits system notes, resolved threads unless they belong to one of FRED's open findings, FRED's own status notes (failures, denials, and command rejections), and summaries written by any of the project's FRED bot users, including former ones. Summaries of other bots, including the retired Claude and Codex accounts, stay because their summary-only findings have no other source.</td></tr>
+<tr><td>FRED's previous findings</td><td>Controller <code>findings</code>, including rejected records, current disposition, latest decision reason, and publication references. Both stages receive this context. Human dismissals remain authoritative until explicitly undone.</td></tr>
+<tr><td>Primary review rules</td><td>Root <code>REVIEW.md</code> at the reviewed SHA, or FRED's defaults with a tip when absent.</td></tr>
+<tr><td>Repo conventions</td><td>Root <code>AGENTS.md</code>, otherwise <code>CLAUDE.md</code>, when present.</td></tr>
+<tr><td>Repo skills</td><td>Every repo <code>SKILL.md</code> is discoverable through the controlled catalog. Skills and references are read from the checkout.</td></tr>
+</table>
+<p>The initial user message of a stage is limited to 192 KiB of UTF-8 text, including rules, metadata, discussions, previous findings, candidates, the skill catalog, the inline manifest or catalog-listing instructions, and inline patches. Inline patches fill only the room the other sections leave. If those sections leave insufficient room even for the catalog-listing instructions, the stage fails with <code>review_input_too_large</code>; these inputs are never silently truncated. These are FRED input bounds, not model token limits. A selected model can reject a smaller input.</p>
+<p><code>list_diffs</code> accepts an optional zero-based UTF-16 <code>cursor</code> and <code>maxBytes</code> with the same 1 KiB to 32 KiB response bounds and 16 KiB default as <code>read_diff</code>. It returns <code>text</code> and <code>nextCursor</code>. Concatenating every page reconstructs the complete JSON-lines manifest. Pages prefer whole rows but can continue a long row without splitting Unicode surrogate pairs. A <code>null</code> cursor marks the end. Invalid cursors fail the tool call. The listing reads only the immutable job catalog.</p>
+<p><code>read_diff</code> accepts a catalog <code>id</code>, <code>range</code> of <code>scope</code> or <code>full</code>, an optional <code>cursor</code>, and <code>maxBytes</code>. Its default encoded JSON response budget is 16 KiB, with an allowed range of 1 KiB to 32 KiB. Each returned fragment carries zero-based patch <code>line</code> and UTF-16 <code>column</code> coordinates, original one-based <code>oldLine</code> and <code>newLine</code> where applicable, and exact text including its newline. <code>nextCursor</code> continues through long lines without splitting Unicode surrogate pairs; <code>null</code> marks the end. Invalid IDs, unavailable ranges, and invalid cursor positions fail the tool call. Tool failures return to the model as text. Deleted patches come from the verified catalog, without filesystem access. Recovered ranges retain their summary-only restriction.</p>
+<p>The agent raises findings on changed code and references untouched code when the change breaks it. Missing required skills add a hint to the response and do not stop review. Repo instructions cannot change the model, budget policy, or sandbox permissions.</p>
+<p>For a capped file count such as <code>325+</code>, the adapter fetches <code>raw_diffs</code> and every recursive repository tree page at the immutable MR base and head commits. It compares blob IDs and modes to establish the complete set of changed paths, including submodules. Existing API entries and raw rename headers pair the changed sides. Recovery requires coverage of every changed side, rejects duplicate or unexpected sections, and checks the reported file-count lower bound. This detects raw responses cut off between files as well as inside hunks. Files absent from the regular API list carry summary-only context, without inline anchors. One summary note explains that findings for files recovered beyond the capped list appear in the summary only. Exact-count MRs retain the regular path and make no tree requests. Tree enumeration adds API reads proportional to repository size only for capped MRs.</p>
+<p>Older GitLab versions without per-file truncation flags cannot distinguish an omitted diff body from some empty binary or mode-only diffs. The worker attempts raw diff recovery for every ambiguous empty body. The raw section then either supplies a verifiable text patch or is validated as one of the supported hunk-less metadata shapes; anything else fails recovery. Complete regular API bodies remain unchanged.</p>
+
+<h2 id="findings">Findings and stages</h2>
+<p>Stage 1 returns candidates. Stage 2 returns a verdict for each candidate and evidence-backed decisions about earlier findings. Both shapes are zod schemas in <code>packages/contracts</code>. Publication status and current disposition are separate facts.</p>
+<table>
+<tr><th>Field</th><th>Values</th></tr>
+<tr><td><code>file</code>, <code>line</code>, <code>oldLine</code></td><td>Path relative to the repo root. Optional <code>line</code> addresses the new file; optional <code>oldLine</code> addresses a deletion. A finding without a usable line appears in the summary.</td></tr>
+<tr><td><code>severity</code></td><td><code>blocking</code>, <code>should_fix</code>, <code>nit</code></td></tr>
+<tr><td><code>title</code>, <code>body</code></td><td>One line and the explanation in markdown.</td></tr>
+<tr><td><code>status</code></td><td><code>pending</code>, <code>posted</code>, <code>rejected</code>, or <code>duplicate</code>. Historical <code>resolved</code> rows remain readable until migration. Fixed, dismissed, and retracted findings remain <code>posted</code>.</td></tr>
+<tr><td><code>disposition</code></td><td><code>open</code>, <code>fixed</code>, <code>dismissed</code>, or <code>retracted</code>. New accepted findings start open. Missing legacy disposition reads as fixed for resolved rows and open otherwise.</td></tr>
+<tr><td><code>rejectReason</code></td><td>Validator's reason. Set only for <code>rejected</code> and <code>duplicate</code>.</td></tr>
+<tr><td><code>discussionId</code></td><td>GitLab discussion ID when an inline discussion exists. Summary-only findings have no discussion ID.</td></tr>
+<tr><td><code>noteId</code></td><td>GitLab note ID for the inline finding. The review job's <code>summaryNoteId</code> links summary-only findings. Older publications can be located through their existing markers.</td></tr>
+<tr><td><code>decisionId</code></td><td>The latest <code>findingDecisions</code> row. A new decision must match this current decision before it can replace the disposition.</td></tr>
+<tr><td>Finding reference</td><td><code>&lt;review-job-id&gt;/&lt;result-index&gt;</code> for new published findings. Included inline and in summaries. A stored finding ID is also accepted by commands.</td></tr>
+</table>
+<p>Stage 2 first rejects unconfirmed candidates, then marks duplicates of findings already raised by a human or another bot. Confirmed new findings stay <code>pending</code> until their publication is acknowledged. Every validator outcome remains stored.</p>
+<pre class="mermaid">
+graph LR
+  cand["stage 1 candidate"] --> v{"stage 2"}
+  v -- "confirmed in code" --> pending
+  pending -- "publication acknowledged" --> posted
+  v -- "not confirmed" --> rejected
+  v -- "already raised by a human or another bot" --> duplicate
+</pre>
+<table>
+<tr><th>Disposition</th><th>Meaning</th></tr>
+<tr><td><code>open</code></td><td>The published finding remains actionable. Open nits do not prevent a clean label.</td></tr>
+<tr><td><code>fixed</code></td><td>The validator verified a code fix.</td></tr>
+<tr><td><code>dismissed</code></td><td>An authorized human explicitly accepted or rejected the concern.</td></tr>
+<tr><td><code>retracted</code></td><td>The validator supplied evidence that the earlier finding was wrong or its requirement was superseded.</td></tr>
+</table>
+<pre class="mermaid">
+stateDiagram-v2
+  open --> fixed: validator verifies code fix
+  open --> dismissed: authorized dismiss command
+  open --> retracted: validator supplies evidence
+  dismissed --> open: undo current decision
+  retracted --> open: undo current decision
+</pre>
+<p>Stage 2 returns <code>findingDecisions</code> with the finding ID, <code>fixed</code> or <code>retracted</code> disposition, and a trimmed reason of 1 to 4000 characters. It cannot dismiss findings or reverse a human dismissal. Generic GitLab thread resolution changes neither disposition nor label.</p>
+<p>The controller changes disposition and appends a <code>findingDecisions</code> row in one transaction. Each row records before and after, reason, actor, source, and available note, review job, command, and SHA references. <code>supersedes</code> links to the previous decision. Historical rows are never deleted or edited.</p>
+
+<h2 id="finding-commands">Finding commands</h2>
+<pre><code>fred dismiss &lt;finding-ref&gt; &lt;reason&gt;
+fred undo &lt;decision-ref&gt; &lt;reason&gt;</code></pre>
+<p>Each command occupies the entire comment as one plain line, with no indentation, quote, code fence, or additional lines. The trimmed reason contains 1 to 2000 characters. A dismiss command targets an open published finding. Undo targets its current dismissal or retraction decision. Fixed findings cannot be reopened through undo.</p>
+<table>
+<tr><th>Rule</th><th>Contract</th></tr>
+<tr><td>Authorization</td><td>The actual note author must be the MR author or have effective project access level 40 or higher, including inherited membership. Notes by any FRED bot user of any project, by users in <code>BOT_USER_IDS_OTHER</code>, and system notes are ignored.</td></tr>
+<tr><td>Verification</td><td>Only MR note events with <code>action: "create"</code> qualify. After acknowledging the webhook, a scheduled controller action reads the current note and MR from configured <code>GITLAB_URL</code> with the project's stored FRED token. A project without a usable token fails verification as a configuration failure. Author and body must still match the delivery. Requests reject redirects and have a 10-second timeout. Webhook-supplied URLs are not used.</td></tr>
+<tr><td>Ownership</td><td>FRED changes only findings with provider <code>fred</code>. A command on a finding of the retired Claude or Codex bots is rejected with <code>That finding belongs to a retired reviewer account. FRED can only change its own findings.</code></td></tr>
+<tr><td>Delivery identity</td><td>Project and note ID identify one durable command receipt. Duplicate deliveries produce no second verification, command, or rejection note. Unknown projects are ignored. The webhook returns HTTP 200 after storing and scheduling a receipt; it makes no GitLab API calls.</td></tr>
+<tr><td>Verification recovery</td><td>Transient GitLab failures allow four attempts, with delays of 5, 30, and 120 seconds. Each attempt schedules a 45-second recovery check before its external reads. Attempt numbers reject duplicate and late completions. Configuration failures, permanent GitLab refusals, and exhausted retries queue one durable failure comment, with no finding decision. After correcting the problem, submit a new command comment.</td></tr>
+<tr><td>Reversal</td><td>Editing or deleting the source comment does not undo an accepted decision. A new <code>fred undo</code> comment must reference the latest decision. An undo reference already advertised in a saved review waits for its pending publication, including a requeued recovery, to finish. The controller resolves the reference and checks its current decision when the worker prepares the command. An unapplied decision from a terminal review is rejected with an explanation. A command whose expected decision changed is also rejected.</td></tr>
+<tr><td>Decision reference</td><td><code>command:&lt;command-id&gt;</code> for a human decision, or <code>&lt;review-job-id&gt;:decision:&lt;finding-id&gt;</code> for a validator decision. Published dismissal and retraction messages include the undo command. A stored decision ID is also accepted.</td></tr>
+<tr><td>Invalid or unauthorized target</td><td>A verified command that lacks permission or an eligible finding receives one durable rejection comment through <code>mrNotes</code>. It changes no disposition.</td></tr>
+</table>
+<p><code>findingCommandRequests</code> stores the parsed command and its verification state: pending, verifying, done, ignored, or failed. Done means authorization finished and the verified result reached command admission, which can still reject an ineligible target. Ignored covers deleted or edited notes, bot accounts, and missing projects. Receipts retain no raw webhook payload or webhook-supplied URLs.</p>
+<p><code>findingCommands</code> stores work separately from <code>reviewJobs</code>. Commands use the same MR exclusion and worker lease as reviews, so a command waits for active review work on that MR. They make no model calls, create no usage rows, count as no review, and do not advance <code>previousReviewedSha</code>. Review policy gates do not apply to commands. Every new command and rejection uses provider <code>fred</code>. The claim returns the same project credential as a review claim. It fails a command whose project has no usable token and queues its failure comment, which is then recorded as <code>note_failed</code>.</p>
+<pre class="mermaid">
+stateDiagram-v2
+  queued --> running: claim the MR
+  running --> running: expired lease reclaimed
+  running --> publishing: save decision and publication
+  running --> done: target changed, rejection comment queued
+  running --> failed: preparation failed
+  publishing --> publishing: recover stored publication
+  publishing --> done: decision and label acknowledged
+  publishing --> failed: recovery exhausted
+</pre>
+<table>
+<tr><th>Status</th><th>Meaning</th></tr>
+<tr><td><code>queued</code></td><td>Verified command waiting for MR ownership.</td></tr>
+<tr><td><code>running</code></td><td>The worker checks current finding state and recovers missing summary references.</td></tr>
+<tr><td><code>publishing</code></td><td>The decision and immutable publication are stored. The worker publishes the decision, updates discussion resolution when applicable, then updates the provider label.</td></tr>
+<tr><td><code>done</code></td><td>Publication completed, or the command became ineligible and its rejection comment was queued.</td></tr>
+<tr><td><code>failed</code></td><td>Preparation failed or publication recovery was exhausted. A failure comment is queued. Any stored decision remains in effect.</td></tr>
+</table>
+<p>Each reported publication failure queues one durable failure comment for its lease generation. It states whether a decision was saved. Any saved decision and effects remain intact. When a saved publication exists and the claim generation is below five, the command remains publishing and becomes claimable after 30 seconds. Otherwise it becomes failed. A subsequent review calculates the label from current dispositions.</p>
+
+<h2 id="output">MR output</h2>
+<table>
+<tr><th>Element</th><th>Content</th></tr>
+<tr><td>Inline discussion</td><td>One per actionable finding with a usable diff position. Files whose patch was recovered as hunk-less metadata or as split rename halves have no usable position. Body starts with the severity. A GitLab HTTP 400 for that position leaves the finding visible in the summary.</td></tr>
+<tr><td>Summary comment</td><td>Published first. Opens with <code>FRED review. Reviewed range:</code> and the actual reviewed base-to-head range, then new counts per severity, hints, and a collapsed list containing every confirmed finding, including nits and stable finding references. Earlier actionable findings appear as a separate count with links. Fix and retraction decisions include their reasons and decision references. Empty results state that no new confirmed findings exist and give the remaining actionable count. A rename recovered from split halves adds a hint that its findings appear in the summary only. A worker with <code>FRED_VERSION</code> closes the comment with <code>&lt;sub&gt;FRED X.Y.Z&lt;/sub&gt;</code>; a stored result keeps the version that saved it when another release publishes it.</td></tr>
+<tr><td>Finding decision</td><td>A fix, dismissal, or retraction records its reason and decision reference. The bot replies to and resolves its own inline discussion when one exists. Undo reopens that discussion. Summary-only decisions remain addressable and publish without a discussion.</td></tr>
+<tr><td>Label</td><td>Scoped label <code>fred-review::clean</code> or <code>fred-review::findings</code>. <code>actionableFindings</code> supplies the same set for summaries and labels: FRED's posted, open <code>blocking</code> and <code>should_fix</code> findings, including earlier reviews. Fixed, dismissed, retracted, and nit findings do not prevent clean. Setting one label removes the other. Both labels must be visible to the project, as project labels or on an ancestor group. Connecting a project creates the missing ones as project labels; the worker never creates labels. A missing label fails the job with reason <code>label_missing</code> and a message to connect the project again. <code>claude-review::</code> and <code>codex-review::</code> labels set by the retired bots stay on their MRs.</td></tr>
+<tr><td>Denial or failure comment</td><td>One line, names the rule or the failure reason. Posted by the controller as the project's FRED bot.</td></tr>
+</table>
+<p>Every write uses the claimed project token, so it appears as the project's FRED bot. Authorship checks accept any of the project's FRED bot users, so discussions and summaries written under a replaced token still count as FRED's for resolution, reconciliation, and prompt filtering.</p>
+<p>The worker checks controller ownership, finding revision, and the current MR head before each review publication effect. Once the head or revision is outdated, it stops further GitLab writes, including labels. On publication recovery, an unacknowledged summary is looked up by its marker and FRED bot authorship before supersession. If it exists, the controller records its note ID and acknowledges publication without overwriting disposition. Already accepted GitLab requests and comments remain.</p>
+<p>Each comment or reply contains a stable hidden <code>fred-review</code> <a href="#glossary">publication marker</a>. Recovery searches every page and verifies FRED bot authorship before repeating a write. GitLab and Convex do not share a transaction, so this is reconciliation rather than an exactly-once guarantee.</p>
+<p>The bot never approves, never unapproves, and never sets a pipeline or commit status.</p>
+
+<h2 id="instructions">Files the reviewed repo may contain</h2>
+<table>
+<tr><th>File</th><th>Role</th><th>Absent</th></tr>
+<tr><td>Root <code>REVIEW.md</code></td><td>Primary project review rules for both stages. Can name other review skills to follow.</td><td>FRED's defaults apply. The response includes a brief tip about this feature.</td></tr>
+<tr><td>Root <code>AGENTS.md</code> or <code>CLAUDE.md</code></td><td>General repo conventions. <code>AGENTS.md</code> wins when both exist. <code>REVIEW.md</code> takes precedence for review rules.</td><td>No convention text is added.</td></tr>
+<tr><td><code>SKILL.md</code> anywhere in the repo</td><td>Discoverable skill instructions. Relative reference files are readable within the checkout.</td><td>A requested missing skill adds a hint and review continues.</td></tr>
+</table>
+<p>Files come from the exact reviewed checkout. Skill loading uses FRED's controlled tools. It does not enable native project hooks, scripts, subagents, or additional MCP servers. Shell execution from review instructions and skills is outside the MVP. Per-project YAML settings are not part of this configuration.</p>
+
+<h2 id="local-development">Local Docker development</h2>
+<p><code>pnpm fred dev</code> runs an isolated self-hosted controller, Node worker, and Convex dashboard for each worktree. A private Compose project owns its database and captured publication effects. Host Node, Git, and Docker with Compose are required. Dependencies are installed inside the Linux image. The host uses a local Unix socket or Windows named pipe; remote Docker hosts are rejected.</p>
+<table>
+<tr><th>Command</th><th>Behavior</th></tr>
+<tr><td><code>up</code></td><td>Builds the current source snapshot, type-checks and deploys local controller functions including the fixture, seeds an empty database, and leaves services running. Prints instance identity, source hash, URLs, and the private admin-key file path. Setup failures print Convex CLI output with credentials redacted.</td></tr>
+<tr><td><code>verify</code></td><td>Starts or updates the instance and verifies one FRED review with simulated model responses. Services started for this command stop afterward; an already running development instance stays up after success.</td></tr>
+<tr><td><code>verify --live openrouter</code></td><td>Uses the real OpenRouter adapter with the fixture project's review pipeline. Agents are authorized to run this check. The token enters through the local client's stdin; it is absent from images, Compose environment, and captured results.</td></tr>
+<tr><td><code>--scenario large-diff</code></td><td>Generates 653 changed entries with long nested paths, over 17 MB of synthetic diff text, and a matching scoped temporary checkout. The counter and deleted-module patches require mid-line continuation reads. Supports simulated or live OpenRouter. Verification requires both stages, complete continued scope reads for both patches, accepted zero-input and deleted-module defects, saved results, acknowledged captured publication, and observed usage in both stages. Output reports prompt bytes and bounded read metadata without patch content.</td></tr>
+<tr><td><code>--model</code>, <code>--effort</code></td><td>Verification can override both stage selections of the fixture pipeline with an OpenRouter <code>vendor/slug</code> and effort. Setting a model without an effort uses <code>default</code>. Effort is <code>default</code>, <code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, or <code>max</code>. Live setup refreshes the public catalog before enqueueing.</td></tr>
+<tr><td><code>verify --scenario provider-failure</code></td><td>Injects a synthetic provider failure and checks the failed job and stored failure note.</td></tr>
+<tr><td><code>inspect --json</code></td><td>Returns job, finding, usage, diagnostic, and captured publication state from a running instance, excluding dashboard sample jobs, findings, and usage. An absent or stopped instance has an explicit empty response.</td></tr>
+<tr><td><code>logs</code></td><td>Prints the last 200 service log lines.</td></tr>
+<tr><td><code>down</code></td><td>Removes the worktree's containers and network. Its local database and captures remain in named volumes.</td></tr>
+<tr><td><code>clean</code></td><td>Removes the worktree's instance, including volumes, built images, and its state directory, and every instance whose recorded worktree no longer exists. Orphans owned by a live command and directories without recorded metadata are skipped and reported.</td></tr>
+</table>
+<p>The source hash covers tracked and untracked nonignored files, including uncommitted edits. Real env files, host dependencies, build output, upstream sources, and the root agent tooling directories <code>.claude/</code> and <code>.agents/</code> are excluded. Checked-in <code>.env.example</code> and <code>.env.local.example</code> templates are retained for setup and tests. Other source symlinks are rejected. Each <code>up</code> or <code>verify</code> command snapshots the checkout; running services do not watch host files. A worktree lock prevents source replacement during verification. Separate worktrees use separate locks and instances.</p>
+<p>Each instance generates its own <code>FRED_TOKEN_KEY</code> and passes it only to the bootstrap container, which sets it on the local controller. Bootstrap runs <code>dev:connectFixture</code>, which connects fixture project 1 like the dashboard does, without asking GitLab: bot user 3, a sealed local token, and the default pipeline when the project has none. The token never leaves the instance, because GitLab calls are captured.</p>
+<p>The runner uses real local Convex claims, leases, review stages, result persistence, accounting, and publication acknowledgements. Git checkout is a fixture directory and GitLab operations are captured service calls. The queued fixture bypasses webhook parsing and enqueue policy. Failure comments are checked in storage; their HTTP delivery is outside this command. A successful live review must identify the fixture's zero-input defect, complete both stages, and persist and acknowledge its publication effects.</p>
+<p>Before enqueueing new fixtures, verification reclaims expired publication leases and finishes captured effects from saved results without model calls. Abandoned queued analysis is marked interrupted instead of starting a provider. Unexpired leases block new verification until they expire. Review history is retained.</p>
+<p><code>OPENROUTER_API_TOKEN</code> is read from the host environment, then root <code>.env.dev</code>, then <code>apps/worker/.env</code>. GitLab tokens and host runtime settings are not forwarded. The local control endpoint binds to container loopback and authenticates with the instance worker secret. Interrupted verification cancels model requests; a failed host verification command stops the local worker.</p>
+<p>Live provider usage stays in the local instance ledger; it is not charged against the shared deployment's monthly budget. Local instance metadata and snapshots live under <code>~/.local/share/fred-dev/</code>. Docker data volumes retain review history across restarts. Verification output identifies the source hash and simulated integrations; it does not establish production installation, actual GitLab behavior, or compatibility on host platforms that have not been exercised.</p>
+
+<h2 id="docker">Docker stack</h2>
+<p><code>docker/compose.yaml</code> runs all of FRED as the Compose project <code>fred</code>, configured by <code>docker/.env</code>. <a href="run-locally.html#docker-deployment">Deploy FRED with Docker</a> is the procedure. <code>docker/Dockerfile</code> builds two images from the repository root: <code>runtime</code> for the worker and the deploy job, and <code>web</code> for nginx with the admin UI. Both carry the optional <code>FRED_VERSION</code> and <code>FRED_RELEASE_SHA</code> build arguments; <code>web</code> writes the version into <code>version.json</code>, and <code>runtime</code> sets both for the worker. A <code>FRED_VERSION</code> that is not SemVer 2.0.0, such as <code>v1.2.3</code>, fails the build. The backend and dashboard images are pinned upstream images, the same as local development.</p>
+<table>
+<tr><th>Service</th><th>Behavior</th></tr>
+<tr><td><code>net</code></td><td>Idle container that owns the network namespace shared by <code>backend</code>, <code>deploy</code>, and <code>worker</code>, so a backend restart keeps the worker's loopback route. Carries the network alias <code>backend</code>.</td></tr>
+<tr><td><code>backend</code></td><td>Self-hosted Convex with SQLite and file storage in the <code>backend-data</code> volume. <code>CONVEX_CLOUD_ORIGIN</code> is <code>FRED_PUBLIC_URL</code> and <code>CONVEX_SITE_ORIGIN</code> is <code>FRED_PUBLIC_URL/api</code>. Telemetry, the metrics endpoint, and database TLS are off. Publishes no ports.</td></tr>
+<tr><td><code>admin-key</code></td><td>One-shot. Derives the deployment admin key from <code>INSTANCE_NAME</code> and <code>INSTANCE_SECRET</code> into the <code>keys</code> volume, readable only by the runtime user. Runs without a network on every start.</td></tr>
+<tr><td><code>deploy</code></td><td>One-shot <code>runtime</code> command <code>deploy</code>, run on every <code>up</code> before the worker starts. Creates <code>FRED_TOKEN_KEY</code> on the controller when none exists and never replaces it. Sets <code>WORKER_SECRET</code>, <code>ADMIN_SECRET</code>, <code>GITLAB_WEBHOOK_SECRET</code>, <code>GITLAB_URL</code>, and <code>BOT_USER_IDS_OTHER</code> from <code>.env</code> where they differ, removing a value cleared in <code>.env</code>; <code>FRED_MAINTENANCE_MODE</code> and other variables stay as operators set them. Deploys the image's controller functions, then runs <code>settings:ensure</code>, which creates the settings row with <code>globalEnabled: false</code> only when none exists. A failure stops <code>up</code> before the worker starts.</td></tr>
+<tr><td><code>worker</code></td><td><code>runtime</code> command <code>worker</code>, the worker bundle with the variables in <a href="#env">Worker</a>. Shares the backend's network namespace through <code>net</code> and reaches the controller at <code>http://127.0.0.1:3210</code>, which satisfies fixture mode. Stopping drains running reviews for up to two hours. Restarts unless stopped.</td></tr>
+<tr><td><code>dashboard</code></td><td>Convex dashboard with <code>NEXT_PUBLIC_DEPLOYMENT_URL</code> set to <code>FRED_PUBLIC_URL</code>. Reached through <code>web</code>.</td></tr>
+<tr><td><code>web</code></td><td>Unprivileged nginx. Serves FRED on container port 8080 for HTTP or 8443 for HTTPS, and the dashboard on 9443. Uses HTTPS when <code>FRED_TLS_DIR</code> holds <code>tls.crt</code> and <code>tls.key</code>, plain HTTP when it holds neither, and refuses to start with only one or when user 101 cannot read the directory or either file, including a symlink whose target lies outside the mount. With HTTPS, port 8080 redirects to <code>FRED_PUBLIC_URL</code>.</td></tr>
+</table>
+<p>The worker, deploy job, and web server run as non-root users without Linux capabilities or privilege escalation. <code>docker compose run --rm --no-deps deploy convex &lt;args&gt;</code> runs the controller's Convex CLI with the derived admin key and with <code>CI</code> set, which keeps the CLI's Sentry reporting off. The deploy job launches the CLI the same way. Images contain no <code>.env</code> files, Git metadata, or host dependencies; <code>.dockerignore</code> excludes them from the build context.</p>
+<table>
+<tr><th>Route on <code>FRED_PUBLIC_URL</code></th><th>Destination</th></tr>
+<tr><td><code>/</code></td><td>Static admin UI. Hashed assets under <code>/assets/</code> cache for a year; <code>index.html</code> never caches.</td></tr>
+<tr><td><code>/api</code> and <code>/api/*</code></td><td>Controller on <code>backend:3210</code>, preserving the path. HTTP requests and WebSocket upgrades.</td></tr>
+<tr><td><code>/api/webhook/gitlab</code></td><td>HTTP action <code>backend:3211/webhook/gitlab</code>.</td></tr>
+<tr><td><code>/version</code> and <code>/instance_name</code></td><td>Convex backend metadata endpoints.</td></tr>
+<tr><td><code>/dashboard</code> and <code>/dashboard/</code></td><td>Redirect to <code>FRED_DASHBOARD_URL</code>.</td></tr>
+</table>
+<p>Request bodies may be up to 128 MB, responses are unbuffered, and upstream reads may pause for 300 seconds.</p>
+<table>
+<tr><th>Variable in <code>docker/.env</code></th><th>Meaning</th></tr>
+<tr><td><code>FRED_PUBLIC_URL</code></td><td>Required. Public origin of the admin UI, controller, and webhook, without a trailing slash. Deployment URL for clients and the dashboard.</td></tr>
+<tr><td><code>FRED_DASHBOARD_URL</code></td><td>Required. Public origin of the dashboard listener.</td></tr>
+<tr><td><code>FRED_HTTP_PORT</code>, <code>FRED_HTTPS_PORT</code>, <code>FRED_DASHBOARD_PORT</code></td><td>Published ports for container ports 8080, 8443, and 9443. Defaults: 80, 443, 8443. An address prefix such as <code>127.0.0.1:8080</code> binds one interface.</td></tr>
+<tr><td><code>FRED_TLS_DIR</code></td><td>Host directory mounted read-only at <code>/etc/nginx/tls</code>. Default <code>./tls</code>.</td></tr>
+<tr><td><code>FRED_IMAGE</code>, <code>FRED_WEB_IMAGE</code>, <code>FRED_TAG</code></td><td>Image names and tag. Defaults <code>fred</code>, <code>fred-web</code>, <code>local</code>; <code>docker compose build</code> builds them from the checkout.</td></tr>
+<tr><td><code>FRED_VERSION</code>, <code>FRED_RELEASE_SHA</code></td><td>Optional build arguments. Empty values leave the worker and the admin UI without a version.</td></tr>
+<tr><td><code>INSTANCE_SECRET</code>, <code>INSTANCE_NAME</code></td><td>Backend instance secret, required, and name, default <code>fred</code>. The admin key derives from both.</td></tr>
+<tr><td><code>WORKER_SECRET</code>, <code>ADMIN_SECRET</code>, <code>GITLAB_WEBHOOK_SECRET</code>, <code>GITLAB_URL</code>, <code>BOT_USER_IDS_OTHER</code></td><td>Controller variables, see <a href="#env">Controller</a>. The first four are required.</td></tr>
+<tr><td><code>OPENROUTER_API_TOKEN</code>, <code>WORKER_MODE</code>, <code>WORKER_FIXTURE_PROJECT_IDS</code>, <code>AI_REVIEW_LIVE</code>, <code>WORKER_CONCURRENCY</code></td><td>Worker variables, see <a href="#env">Worker</a>. The token is required.</td></tr>
+<tr><td><code>FRED_MONTHLY_BUDGET</code>, <code>FRED_TIMEZONE</code></td><td>Default monthly budget in USD and organization timezone for a new settings row. Defaults 3000 and <code>Europe/Berlin</code>. Every deploy checks both and fails on an invalid value; they take effect only when the row is created.</td></tr>
+<tr><td><code>RUST_LOG</code></td><td>Backend log filter. Default <code>info</code>.</td></tr>
+</table>
+<p>The <code>backend-data</code> volume is the deployment's state, including <code>FRED_TOKEN_KEY</code>; <code>INSTANCE_SECRET</code> in <code>.env</code> is needed to open it. Backups of it are as sensitive as <code>.env</code>. The <code>keys</code> volume is derived and recreated on every start.</p>
+
+<h2 id="projects">Projects and tokens</h2>
+<p>Each project reviews through its own FRED bot. The admin creates a GitLab project access token in the project, names it <code>0 FRED</code> so the bot sorts first in reviewer pickers, and pastes it on the admin <strong>Projects</strong> page. GitLab creates a bot user for every project access token; that bot user is FRED in the project. A project is connected when it has a stored token and a review pipeline. New jobs, findings, usage rows, failures, and notes use provider <code>fred</code>.</p>
+<pre class="mermaid">
+sequenceDiagram
+  participant A as Admin UI
+  participant C as Controller
+  participant GL as GitLab
+  A->>C: admin.connectProject, token and pipeline
+  C->>GL: token metadata, bot user, its one project, its role
+  GL-->>C: project, bot user ID, scopes, expiry
+  C->>GL: create missing fred-review labels
+  C->>C: seal token, store projectTokens row and pipeline
+  C->>GL: set FRED's face as the bot's avatar
+  C-->>A: project path, created labels, and whether the avatar was set
+</pre>
+<table>
+<tr><th>Check</th><th>GitLab request</th><th>Requirement</th></tr>
+<tr><td>Token</td><td><code>GET /personal_access_tokens/self</code></td><td>Active, not revoked, and has the <code>api</code> scope.</td></tr>
+<tr><td>Bot user</td><td><code>GET /user</code></td><td>A bot user. A personal access token is refused.</td></tr>
+<tr><td>Project</td><td><code>GET /projects?membership=true</code></td><td>The token reaches exactly one project. FRED takes the project from the token.</td></tr>
+<tr><td>Role</td><td><code>GET /projects/:id/members/all/:bot</code></td><td>Access level 30, Developer, or higher.</td></tr>
+<tr><td>Labels</td><td><code>GET /projects/:id/labels?include_ancestor_groups=true</code>, then <code>POST /projects/:id/labels</code></td><td>Creates <code>fred-review::clean</code> and <code>fred-review::findings</code> as project labels when no project or ancestor group label of that name exists.</td></tr>
+<tr><td>Avatar</td><td><code>PUT /user/avatar</code>, GitLab 17.0 or later</td><td>Uploads <code>apps/ui/public/fred-icon.png</code>, embedded in <code>botAvatar.ts</code>, as the bot's avatar after the token is stored. A refused upload does not stop the connect.</td></tr>
+</table>
+<p>A project token cannot rename its bot; GitLab names the bot after the token when the token is created. A bot not named <code>0 FRED</code> connects, and the <strong>Projects</strong> page warns until the admin replaces it with a token named <code>0 FRED</code>.</p>
+<p>The checks use <code>GITLAB_URL</code>, reject redirects, time out after 10 seconds, and never retry. A failed check stops the connect with a sentence for the admin, such as <code>GitLab rejected the token. It is revoked, expired, or mistyped.</code> Connecting a project creates its <code>projects</code> row when FRED has not seen it, and updates the stored path after a rename.</p>
+<table>
+<tr><th>Operation</th><th>Behavior</th></tr>
+<tr><td><code>admin.projects</code></td><td>Query. Every <code>projects</code> row, connected first, then by path, with GitLab ID, path, pipeline and <code>pipelineRevision</code>, <code>collectTranscripts</code> as a boolean, token metadata or <code>null</code>, and the creation time of its latest review. Also returns the model catalog and its fetch time, <code>defaultStageModels</code> as <code>defaultPipeline</code>, <code>now</code>, and <code>gitlabUrl</code>. Token metadata is name, bot username and user ID, scopes, access level, expiry, last check time, and problem. No admin function returns the sealed or plaintext token.</td></tr>
+<tr><td><code>admin.connectProject</code></td><td>Action with <code>token</code>, optional <code>stageModels</code>, and optional <code>gitlabProjectId</code>. Runs the checks above, creates missing labels, seals the token, and stores it through <code>projectTokens.store</code>. A first connect requires a pipeline valid against the catalog, otherwise <code>pipeline_required</code>. A reconnect keeps the project's pipeline unless one is passed. With <code>gitlabProjectId</code>, a token of another project is refused: <code>This token belongs to &lt;path&gt;, not to the project you are replacing.</code> Replacing a token replaces the row and appends a new bot user ID to <code>projects.botUserIds</code>. Returns the project ID, path, created label names, and <code>avatarSet</code>.</td></tr>
+<tr><td><code>admin.checkProject</code></td><td>Action. Rechecks one connected token with GitLab and stores the result the periodic check would. Returns the problem or <code>null</code>.</td></tr>
+<tr><td><code>admin.savePipeline</code></td><td>Mutation with <code>projectId</code>, <code>stageModels</code>, and <code>expectedRevision</code>. A stale revision rejects with <code>pipeline_changed</code>. Validates model and effort pairs against the stored catalog, rejecting with <code>unsupported_model_selection</code> or <code>model_catalog_unavailable</code>. Increments <code>pipelineRevision</code>. Queued and running reviews keep their snapshot.</td></tr>
+<tr><td><code>admin.disconnectProject</code></td><td>Mutation. Deletes the project's token row. The pipeline, former bot user IDs, and all history remain.</td></tr>
+<tr><td><code>admin.refreshModels</code></td><td>Action. Refreshes the OpenRouter catalog the pipeline editor offers. See <a href="#models">review pipelines</a>.</td></tr>
+<tr><td>Cron <code>check project tokens</code></td><td>Runs <code>projectTokens.checkAll</code> every six hours. Rechecks every stored token with GitLab. A passing check refreshes token ID, name, scopes, expiry, and access level and clears <code>problem</code>. A failing check records <code>problem</code>. A token that now reaches another project or bot user, or a sealed token that no longer opens, is a problem.</td></tr>
+<tr><td><code>projectTokens:setAllAvatars</code></td><td>Internal action with empty arguments. Sets FRED's face on every connected bot, for projects connected before connecting set the avatar. Returns the GitLab project IDs whose upload failed.</td></tr>
+<tr><td><code>migrations:retireLegacyQueue</code></td><td>Internal mutation with empty arguments. Supersedes up to 100 queued and 100 publishing review jobs of each retired bot, <code>claude</code> and <code>codex</code>, per call, with diagnostic reason <code>retired_bot</code>, and marks up to 100 queued finding commands of each retired bot failed with <code>retired reviewer account</code>. Posts no MR comment. Returns <code>jobs</code>, <code>commands</code>, and <code>remaining</code>; repeat until <code>remaining</code> is <code>false</code>. Findings, results, and usage stay. Running retired reviews fail when their lease expires.</td></tr>
+</table>
+<h3>Token storage</h3>
+<p><code>projectTokens.sealedToken</code> is AES-256-GCM ciphertext under the controller's <code>FRED_TOKEN_KEY</code>, 32 random bytes in base64, with a fresh 12-byte IV per seal. The GitLab project ID is authenticated data, so a sealed token opens only for its own project. Maintenance agents may read controller data, which is why the token is never stored in plain text. Only functions in <code>projectTokens.ts</code> open tokens, for the worker claim, MR note delivery, finding-command verification, and token checks. A changed or missing key makes every stored token unreadable; each project then needs its token pasted again.</p>
+<h3>Token lifecycle</h3>
+<p>The admin UI marks a token with a warning within 30 days of its expiry and as failed when it has expired or the last check recorded a problem. GitLab's <strong>Rotate</strong> keeps the same bot user; paste the new value with <strong>Replace</strong>. A brand-new token creates a new bot user. FRED appends that user to <code>projects.botUserIds</code> and keeps every former one, so discussions and summaries the old bot wrote still count as FRED's for resolution, reconciliation, and prompt filtering. Reviewer assignments of the old bot user no longer trigger reviews.</p>
+<p>After a disconnect, new merge request webhooks for the project are ignored as not connected. Already queued reviews fail at claim, queued finding commands are marked failed, command verification fails as a configuration failure, and MR notes cannot be delivered. Connecting the project again reverses this for new requests; failed work needs a new request.</p>
+<h3>Retired bots</h3>
+<p>The provider keys <code>claude</code> and <code>codex</code> belong to the retired shared GitLab user accounts that reviewed before project access tokens. They remain in the schema so their jobs, findings, usage rows, failures, labels, and spend stay readable. The Reviews filter offers all bots. Overview always shows FRED and shows a retired bot only in a month in which it completed reviews. Retired bots never trigger, the worker claims only <code>fred</code>, and finding commands on their findings are rejected. A retired bot's running review fails when its lease expires. A retired bot's publishing job is never reclaimed and keeps its MR busy for every provider, so its publication must finish before the cutover.</p>
+
+<h2 id="models">Review pipelines</h2>
+<p>Each connected project has a review pipeline: a model and effort for the detection stage and for the validation stage, stored in <code>projects.stageModels</code> and chosen from the compatible OpenRouter catalog. The admin chooses it at first connect, prefilled with <code>defaultStageModels</code>, and edits it on the <strong>Projects</strong> page. Bot identity controls GitLab ownership, labels, and policy, not model vendor.</p>
+<p><code>admin.refreshModels</code> reads OpenRouter's public model catalog through the official SDK without credentials. A successful refresh replaces the stored catalog. A failed or empty refresh leaves the previous catalog intact. An older concurrent refresh cannot replace a newer snapshot. Eligible models have a valid OpenRouter ID, positive context length, text input and output, and tool support. Batch-only models are excluded. The stored metadata includes context length, maximum completion tokens, supported parameters, and reasoning options.</p>
+<p><code>default</code> omits a reasoning override. Explicit options are <code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, and <code>max</code>, filtered by each model's reasoning metadata. Models with mandatory reasoning exclude <code>none</code>. The form retains a supported effort when changing models; otherwise it selects the new model's default.</p>
+<table>
+<tr><th>Stage</th><th>Default model</th><th>Default effort</th></tr>
+<tr><td>Detection</td><td><code>openai/gpt-6-astra</code></td><td>medium</td></tr>
+<tr><td>Validation</td><td><code>openai/gpt-6-astra</code></td><td>medium</td></tr>
+</table>
+<p>The defaults are <code>defaultStageModels</code> in <code>packages/contracts/src/models.ts</code>. They only prefill a first connect; enqueue never falls back to them. Availability and supported efforts come from OpenRouter. New catalog models require no source edit, price entry, or deployment. Catalog eligibility does not establish review quality or successful operation on every upstream route.</p>
+<table>
+<tr><th>Operation</th><th>Behavior</th></tr>
+<tr><td>Enqueue</td><td>Copies the project's pipeline to <code>reviewJobs.stageModels</code>. A project without a pipeline is not connected and enqueues nothing. Later changes affect only newly queued reviews. A new analysis retry takes the current pipeline. Publication recovery retains the original job, selections, and result.</td></tr>
+<tr><td>Historical jobs</td><td>Jobs without <code>stageModels</code> and saved native model IDs fail visibly if analysis starts. Stored publication recovers without model validation or another model call.</td></tr>
+<tr><td>Retired settings</td><td><code>settings.reviewModels</code> and <code>settings.modelsRevision</code>, the former global selections per bot, stay readable on existing rows. Nothing reads or writes them.</td></tr>
+</table>
+
+<h3>Worker model loop</h3>
+<p>The worker uses Effect <code>4.0.0</code> with <code>Context.Service</code> and the official <code>@openrouter/sdk</code> <code>1.4.21</code>. One adapter uses nonstreaming <code>chat.send</code> requests for every review. Requests target <code>https://openrouter.ai/api/v1</code>, reject redirects, and disable SDK diagnostic logging. <code>OPENROUTER_API_TOKEN</code> is the only model credential.</p>
+<p>Every model request includes <code>cache_control: { "type": "ephemeral" }</code> to request <a href="https://openrouter.ai/docs/guides/best-practices/prompt-caching">automatic prompt caching</a> as the conversation grows. This applies to both stages, without a model allowlist. Anthropic uses the default five-minute lifetime. Cache support, lifetime, and minimum prompt length depend on the upstream provider. Each stage retains one <code>session_id</code> for OpenRouter's provider routing.</p>
+<p>The worker exposes <code>read</code>, <code>glob</code>, <code>grep</code>, <code>list_skills</code>, <code>load_skill</code>, <code>read_diff</code>, <code>list_diffs</code>, and <code>submit_review</code>. Repository tools retain checkout path and symlink checks. The model cannot call a shell, write files, inspect unrelated host files, load native hooks, or enable network tools. The claimed GitLab token and controller credentials stay in the worker.</p>
+<p><code>submit_review</code> is the only successful final response. The validation tool exposes flat verdict objects with an enum value and an optional reason. The provider-facing schema is derived from the shared contract and avoids object unions. The worker validates every submission with the original shared zod stage schema, which requires a nonempty reason for rejected and duplicate verdicts. Literal tool parameters use singleton enums. Job-specific validation checks the exact verdict count, unique in-range verdict indexes, and unique eligible previous-finding decisions before accepting a submission. These relationship checks run locally and use the same correction attempt as other schema errors; they do not add array-length restrictions to the provider's tool schema. Result assembly repeats the checks before saving publication intent. A submission that is not alone, not valid JSON, or does not match the schema is returned to the model once as a tool result naming the defect and recorded as a <code>submission_rejected</code> diagnostic; a second invalid submission fails the stage. A response that stops with text and no tool call is answered once with a user message asking for <code>submit_review</code>, recorded as a <code>submission_rejected</code> diagnostic with code <code>missing_result</code>; this request is counted separately from the submission correction, and a second text-only stop fails the stage. Refusal, truncated output, or a malformed tool call fails the stage. The worker preserves assistant messages, including reasoning metadata, between tool calls. It requests routes that support the supplied parameters.</p>
+<p>Each stage has a 45-minute deadline. Cancellation aborts the active SDK request. When OpenRouter reports an upstream overload, rate limit, or server error, in an HTTP 200 error body or as HTTP 408, 429, 500, 502, 503, or 504, the adapter sends the same request again up to three times, after about 5, 10, and 20 seconds. Each attempt records its reported usage. It does not replay other failed requests, trim conversation history, or impose a model-call or tool-call count limit. Tool replies remain in conversation history, so a review can still exceed a model context limit after its initial request. Local Docker checks exercise live model behavior and controlled tools. Real GitLab acceptance requires the dedicated fixture-project procedure in <a href="run-locally.html">the local run guide</a>.</p>
+
+<h3>Reported usage</h3>
+<p>The adapter observes each response before executing tools or making the next request, including available usage on error responses. It accumulates request costs and tokens within the stage. The worker serializes observations, appends positive deltas with stable event keys, and advances its baseline after the controller acknowledges the row. Repeated observations do not double-charge.</p>
+<p>Every new row records OpenRouter's reported cost, the resolved response model, and <code>priceTableVersion: "openrouter-reported-v1"</code>. If the served model ID does not fit the selection contract, the row records the requested model instead. Prompt tokens are clamped at zero when cached and cache-write counts exceed the reported prompt total. The reported cost is recorded in both cases. Missing cost marks <code>usageIncomplete</code> and skips that request's usage row, including its tokens. Later requests with reported costs are still recorded. Missing usage, counter resets, and unconfirmed final usage also mark a gap. No static price table or estimated zero-cost row fills missing observations.</p>
+<p>The month and day are computed in the organization timezone at write time. Historical usage rows retain their original accounting versions. The ledger records observed spend; it does not guarantee agreement with the account bill or persistence before the next model call. A crash can leave unobserved usage.</p>
+
+<h2 id="data">Data model</h2>
+<p>Tables in <code>apps/controller/convex/schema.ts</code>. Ids are Convex document ids unless stated. Every <code>provider</code> field is <code>fred</code>, <code>claude</code>, or <code>codex</code>. New rows use <code>fred</code>; the other two are the <a href="#projects">retired bots</a>.</p>
+<pre class="mermaid">
+erDiagram
+  developers ||--o{ reviewJobs : authors
+  developers ||--o{ usageEvents : owns
+  developers ||--o{ usageMonthly : "month rollup"
+  usageEvents }o--|| usageDaily : "summed per day, provider, model"
+  usageEvents }o--|| usageMonthly : "summed per month, owner"
+  developers ||--o{ findings : "raised on their MRs"
+  developers ||--o| budgets : has
+  projects ||--o{ reviewJobs : contains
+  projects ||--o{ projectPolicies : governs
+  projects ||--o| projectTokens : "connected by"
+  reviewJobs ||--o{ usageEvents : "observed usage deltas"
+  reviewJobs ||--o{ findings : produces
+  findings ||--o{ findingDecisions : records
+  findings ||--o{ findingCommands : targets
+  findingCommands ||--o| findingDecisions : applies
+  projects ||--o{ findingCommands : contains
+  projects ||--o{ findingCommandRequests : receives
+  reviewJobs ||--o{ reviewFailures : "failed or denied at claim"
+  reviewJobs ||--o{ transcripts : "one per stage attempt"
+  reviewJobs ||--o| reviewOutcomes : "once done"
+  projects ||--o{ reviewFailures : "denied at enqueue"
+  settings {
+    boolean globalEnabled
+    number defaultBudgetUsd
+    string orgTimezone
+    object reviewModels "optional, retired global selections per bot"
+    number modelsRevision "optional, retired"
+  }
+  modelCatalog {
+    array models "compatible OpenRouter model metadata"
+    number fetchedAt
+  }
+  developers {
+    string gitlabUserId
+    string username "optional, known when the developer triggered a job"
+    string displayName "optional, GitLab name captured when the budget owner triggers a job"
+    boolean blocked "optional"
+    string blockedReason "optional"
+  }
+  budgets {
+    id developerId
+    number monthlyUsd
+  }
+  projects {
+    string gitlabProjectId
+    string path
+    boolean collectTranscripts "optional, transcript collection switch"
+    object stageModels "optional, review pipeline, set at first connect"
+    number pipelineRevision "optional, guards stale pipeline saves"
+    array botUserIds "optional, every FRED bot user of the project, oldest first"
+  }
+  projectTokens {
+    id projectId
+    string sealedToken "AES-256-GCM under FRED_TOKEN_KEY"
+    number tokenId
+    string name
+    array scopes
+    string expiresAt "yyyy-mm-dd or null"
+    string botUserId
+    string botUsername
+    number accessLevel
+    number checkedAt
+    string problem "optional, last failed check"
+  }
+  projectPolicies {
+    id projectId
+    string provider
+    boolean allowed
+  }
+  reviewJobs {
+    id projectId
+    number mrIid
+    string headSha
+    string previousReviewedSha "optional, selected at claim"
+    object stageModels "optional on legacy jobs, fixed at enqueue"
+    boolean collectTranscripts "optional, fixed at enqueue, written only when true"
+    string provider
+    string status
+    id developerId
+    string triggeredBy
+    string failureReason
+    string denialReason "policy rule or failure text, the MR comment"
+    number claimedAt
+    number deadlineAt "legacy rows"
+    number completedAt
+    string workerId
+    string leaseToken
+    number leaseGeneration
+    number leaseExpiresAt "0 once stale cleanup reported an expired publishing lease"
+    string diagnosticJson "lifecycle snapshot and legacy metadata, optional"
+    string resultJson "immutable validated result and effects"
+    string fredVersion "optional, FRED_VERSION of the worker that saved resultJson"
+    string findingRevision "latest decision when publication is current"
+    string summaryNoteId "GitLab summary note, optional"
+    array publicationAcks
+    boolean usageIncomplete
+    array usageConfirmedStages
+    string usageIncompleteReason
+    string deliveryKey "webhook delivery that created the job, absent on legacy rows"
+    string firstUsageDay "day of the first priced usage row, counts the review once"
+  }
+  transcripts {
+    id jobId
+    number leaseGeneration
+    string stage
+    string model
+    string effort
+    string outcome "completed, failed, timed_out, or interrupted"
+    id storageId "optional, gzipped JSON in file storage"
+    string omitted "optional, too_large"
+    number bytes "gzipped size, 0 when omitted"
+    number turns
+    number toolCalls
+    number durationMs
+    string release "optional, FRED_RELEASE_SHA"
+    string fredVersion "optional, FRED_VERSION"
+    string reviewRulesSha "optional, SHA-256 of the review rules"
+    number recordedAt
+  }
+  diagnosticSnapshots {
+    id jobId
+    string snapshotJson "worker snapshot, lease-fenced"
+  }
+  diagnosticEvents {
+    id jobId "optional before a job exists"
+    string gitlabProjectId
+    string projectPath
+    number mrIid
+    string provider
+    number leaseGeneration
+    string eventJson "validated metadata"
+    number recordedAt
+    number expiresAt
+  }
+  webhookDeliveries {
+    string key
+  }
+  usageEvents {
+    string eventKey
+    boolean incomplete
+    id jobId
+    id developerId
+    string month "yyyy-mm at write time"
+    string day "yyyy-mm-dd at write time, optional until backfilled"
+    string provider
+    string model
+    string stage
+    number inputTokens
+    number cachedInputTokens
+    number outputTokens
+    number costUsd
+    string priceTableVersion
+    string fredVersion "optional, FRED_VERSION of the reporting worker"
+    id supersedes "correction row, points at the replaced row"
+    boolean rolledUp "in both rollups, set at insert or by the backfill"
+  }
+  usageDaily {
+    string day "yyyy-mm-dd"
+    string provider
+    string model
+    number costMicroUsd "integer micro-dollars"
+    number inputTokens
+    number cachedInputTokens
+    number outputTokens
+    number reviews "jobs whose first priced row fell on the day"
+  }
+  usageMonthly {
+    string month "yyyy-mm"
+    id developerId
+    number costMicroUsd "integer micro-dollars, the budget gate reads this"
+    number inputTokens
+    number cachedInputTokens
+    number outputTokens
+    number reviews "jobs whose first priced row fell in the month"
+  }
+  reviewOutcomes {
+    id jobId
+    string provider
+    number completedAt
+    boolean clean "published label was clean"
+    object findings "blocking, should_fix, nit, duplicates excluded"
+    number validatorRejected
+    number claimWaitMs "optional, absent when never claimed"
+    number runMs "optional, absent when never claimed"
+  }
+  reviewFailures {
+    id jobId "optional, absent for enqueue-time denials"
+    id noteId "optional, original failed delivery note"
+    number leaseGeneration "optional, selects the failure comment"
+    id projectId
+    number mrIid
+    string provider
+    string kind "failed, denied, or note_failed"
+    string reason "failure reason, denial gate, or delivery"
+    string summary "the sanitized comment text"
+    string failureCategory "optional, lifted from the diagnostic"
+    string providerCode "optional, lifted from the diagnostic"
+    id developerId "optional budget owner"
+    string triggeredBy "optional"
+    number at
+  }
+  findings {
+    id jobId
+    id projectId
+    number mrIid
+    string provider
+    string file
+    number line "optional new-file line"
+    number oldLine "optional deleted line"
+    number resultIndex
+    string severity
+    string title
+    string body
+    string status
+    string disposition "open, fixed, dismissed, or retracted"
+    string rejectReason
+    string discussionId
+    string noteId "inline GitLab note, optional"
+    id decisionId "latest decision, optional"
+  }
+  findingDecisions {
+    id findingId
+    id projectId
+    number mrIid
+    string provider
+    string eventKey
+    string before
+    string after
+    string reason
+    string actorId
+    string source "human, validator, or migration"
+    id jobId "optional"
+    id commandId "optional"
+    string noteId "source GitLab note, optional"
+    string headSha "optional"
+    id supersedes "previous decision, optional"
+  }
+  findingCommandRequests {
+    id projectId
+    string noteId
+    object command "MR IID, actor, action, reference, reason, body"
+    string status "pending, verifying, done, ignored, or failed"
+    number attempts
+    number nextAttemptAt
+    string failure "configuration, gitlab, or exhausted; optional"
+  }
+  findingCommands {
+    id projectId
+    number mrIid
+    string provider
+    string noteId
+    string actorId
+    string action "dismiss or undo"
+    id findingId
+    string expectedDecisionRef "current ID or advertised event key; nullable"
+    string reason
+    string status
+    string workerId "optional"
+    string leaseToken "optional"
+    number leaseExpiresAt "optional"
+    number leaseGeneration "optional"
+    string resultJson "immutable decision publication, optional"
+    array publicationAcks
+    string failure "optional"
+  }
+  mrNotes {
+    id jobId "optional, legacy rows use key"
+    string failureJson "durable compact failure snapshot, optional"
+    string key
+    string gitlabProjectId
+    string projectPath
+    number mrIid
+    string provider
+    string body
+    string status
+    number attempts
+    string lastError "optional"
+  }
+  providerCostSnapshots {
+    string provider "reserved for cost reconciliation"
+    string day
+    number costUsd
+    number fetchedAt
+  }
+  policyAudit {
+    string actor "admin or dashboard, written by transcript switches and deletions"
+    string table
+    string rowId
+    string before
+    string after
+    number at
+  }
+</pre>
+<table>
+<tr><th>Table</th><th>Indexes</th></tr>
+<tr><td><code>developers</code></td><td><code>by_gitlab_user</code></td></tr>
+<tr><td><code>budgets</code></td><td><code>by_developer</code></td></tr>
+<tr><td><code>projects</code></td><td><code>by_gitlab_project</code>, <code>by_path</code></td></tr>
+<tr><td><code>projectTokens</code></td><td><code>by_project</code></td></tr>
+<tr><td><code>projectPolicies</code></td><td><code>by_project_provider</code></td></tr>
+<tr><td><code>reviewJobs</code></td><td><code>by_project</code>, <code>by_status_provider</code>, <code>by_status_expiry</code>, <code>by_status_completed</code>, <code>by_usage_incomplete</code> on the incomplete flag and creation time, <code>by_legacy_deadline</code>, <code>by_mr</code>, <code>by_dedupe</code> on project, mr, sha, provider; <code>by_dedupe_status</code> adds status for bounded outstanding-work lookup</td></tr>
+<tr><td><code>transcripts</code></td><td><code>by_job</code> on job, lease generation, and stage</td></tr>
+<tr><td><code>diagnosticSnapshots</code></td><td><code>by_job</code></td></tr>
+<tr><td><code>diagnosticEvents</code></td><td><code>by_job</code>, <code>by_project</code>, <code>by_path_mr</code>, <code>by_mr</code>, <code>by_recorded</code>, <code>by_expiry</code></td></tr>
+<tr><td><code>webhookDeliveries</code></td><td><code>by_key</code></td></tr>
+<tr><td><code>usageEvents</code></td><td><code>by_developer_month</code>, <code>by_day</code>, <code>by_job</code>, <code>by_event</code> on job and event key, <code>by_rolled_up</code> for the backfill</td></tr>
+<tr><td><code>usageDaily</code></td><td><code>by_day_provider_model</code>; the writer finds one row by all three, the spend query ranges over its <code>day</code> prefix</td></tr>
+<tr><td><code>usageMonthly</code></td><td><code>by_developer_month</code> for the budget gate, <code>by_month</code> for the spend by-owner table</td></tr>
+<tr><td><code>reviewOutcomes</code></td><td><code>by_completed</code> for the overview's month, <code>by_job</code> for the backfill's skip check</td></tr>
+<tr><td><code>reviewFailures</code></td><td><code>by_at</code>, <code>by_kind_at</code>, <code>by_job</code></td></tr>
+<tr><td><code>findings</code></td><td><code>by_job</code>, <code>by_mr_provider</code></td></tr>
+<tr><td><code>findingDecisions</code></td><td><code>by_event</code>, <code>by_finding</code>, <code>by_mr_provider</code></td></tr>
+<tr><td><code>findingCommandRequests</code></td><td><code>by_note</code> (project, note)</td></tr>
+<tr><td><code>findingCommands</code></td><td><code>by_note</code>, <code>by_status_provider</code>, <code>by_mr</code></td></tr>
+<tr><td><code>mrNotes</code></td><td><code>by_key</code>, <code>by_job</code>, <code>by_mr</code></td></tr>
+<tr><td><code>providerCostSnapshots</code></td><td><code>by_provider_day</code></td></tr>
+<tr><td><code>policyAudit</code></td><td><code>by_at</code></td></tr>
+</table>
+<p><code>findingDecisions</code> is append-only. The controller updates a finding's current disposition and inserts its decision in one transaction. <code>migrations.backfillFindingDisposition</code> explicitly converts legacy resolved rows to posted, fixed findings with migration provenance. It marks legacy posted rows open. The migration preserves saved review JSON and recoverable publication, and does not invent missing original actors or timestamps. Audit rows that leave disposition unchanged do not invalidate publication. It processes at most 500 matching rows per call. See <a href="run-locally.html#backfill-finding-disposition">the migration procedure</a>.</p>
+<p><code>usageEvents</code> contains append-only observed usage deltas. Row counts depend on provider observations; missing usage remains an explicit gap. Each row carries <code>month</code> as <code>yyyy-mm</code> and <code>day</code> as <code>yyyy-mm-dd</code>, both in the org timezone at write time. Rows written before the day column existed get it from the one-off <code>migrations.backfillUsageDay</code>, after which the column becomes required. Nothing reads the ledger by range: the budget gate and the spend page read the rollups below, and per-job spend on the queue and failure pages reads <code>by_job</code>.</p>
+<p><code>usageDaily</code> and <code>usageMonthly</code> are rollups of the ledger. <code>recordUsage</code> adds each new row to both in the same transaction as the insert, after the event key dedupe, so a retried report adds once and the rollups cannot drift from the ledger. Cost is stored as integer micro-dollars in <code>costMicroUsd</code> and converted to dollars on read; the ledger keeps <code>costUsd</code> as reported. <code>reviews</code> is not a sum of rows: a job counts once, on the day and month of its first priced row, recorded on the job as <code>firstUsageDay</code>. A future correction row with <code>supersedes</code> must add the difference to the rollups, not the new amount; nothing writes corrections today. Two workers patching the same rollup row at once is an OCC conflict Convex retries. After a deploy that introduces the rollups, run <code>migrations.backfillUsageRollups</code> until <code>remaining</code> is false; until then the rollups hold only rows written since the deploy, and the spend page and budget gate under-report. The backfill marks each folded row <code>rolledUp</code> and skips rows <code>recordUsage</code> already marked, so it can be rerun or resumed. One exception to the first-row rule: a job in flight at that deploy is counted on the day of its first post-deploy row, and the backfill adds its older rows' amounts without moving the review. This affects at most one job per worker slot, once. See <a href="run-locally.html#backfill-usage-rollups">the operator step</a>.</p>
+<p><code>reviewOutcomes</code> holds one small row per done job: its provider, completion time, whether the published label was clean, findings by severity with validator rejects counted apart and duplicates in neither, claim wait, and run time. <code>findingCounts</code> in <code>reviewOutcomes.ts</code> is the one counting rule for these rows, the Reviews table, and the Reviews totals. <code>jobs.complete</code> inserts it in the same transaction that marks the job done, and a done job never leaves that status, so each job has at most one row. Counts are final at completion: later finding decisions change disposition, never severity or a validator reject. <code>admin.overview</code> reads the month's rows through <code>by_completed</code> instead of every done job, whose saved result and diagnostic snapshot made that read grow past Convex's per-query limits. After the deploy that introduces the table, run <code>migrations.backfillReviewOutcomes</code> until <code>remaining</code> is false; until then the overview counts only reviews completed since the deploy. See <a href="run-locally.html#backfill-review-outcomes">the operator step</a>. Rows written before duplicates were excluded count them by severity until <code>migrations.recountOutcomeFindings</code> has run; see <a href="run-locally.html#recount-outcome-findings">recount outcome findings</a>.</p>
+<p><code>reviewFailures</code> is the append-only failure ledger. Every job failure, every claim denial, every enqueue-time denial, and every comment delivery that GitLab never accepted appends one row. Rows survive deliberate recovery, which clears the job's own failure fields, and they do not expire with diagnostic events. Detail for a failed job comes from the failure comment's compact snapshot, selected by job and lease generation. Failed delivery rows retain <code>noteId</code> and take their lease generation and snapshot from that original note, even after publication recovery. The worker ID is omitted when the current job belongs to a different lease.</p>
+
+<h2 id="versioning">Versioning and releases</h2>
+<p>FRED follows <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning 2.0.0</a> with one version for the whole repository. The release tag <code>vX.Y.Z</code> is the only source. Package manifests stay at <code>0.0.0</code>, and nothing commits a version to <code>main</code>.</p>
+<p>The public API is what users and operators depend on. A change that breaks any of it is breaking:</p>
+<table>
+<tr><th>Consumer</th><th>Public API</th></tr>
+<tr><td>GitLab users</td><td>The <code>0 FRED</code> token name, adding the FRED bot as reviewer to trigger a review, finding commands, the <code>fred-review::findings</code> and <code>fred-review::clean</code> labels, and the root <code>REVIEW.md</code> contract.</td></tr>
+<tr><td>Operators</td><td>Environment variables, the setup wizard, the <code>pnpm fred</code> CLI, the Docker stack's services, volumes, and image commands.</td></tr>
+<tr><td>Data</td><td>The data export archive, <code>fred-export/1</code>, and the transcript file, <code>fred-transcript/1</code>.</td></tr>
+</table>
+<p>Convex tables and the protocol between worker and controller are internal, because one release ships both. At the open-source release, <code>1.0.0</code>, self-hosters start running schema migrations and may run workers on their own machines, so both join the public API.</p>
+<p>Until <code>1.0.0</code>, every deployment of <code>main</code> is a release. <code>scripts/release.mjs</code> reads the MR titles on <code>main</code> since the newest tag from GitLab's merge commits:</p>
+<table>
+<tr><th>Change since the previous release</th><th>Before 1.0.0</th><th>From 1.0.0</th></tr>
+<tr><td>Title with <code>!</code> before the colon</td><td>minor</td><td>major</td></tr>
+<tr><td><code>feat</code></td><td>minor</td><td>minor</td></tr>
+<tr><td>Anything else</td><td>patch</td><td>patch</td></tr>
+</table>
+<p>The first release is <code>0.1.0</code>. Automation never reaches <code>1.0.0</code>: a maintainer creates the <code>v1.0.0</code> release by hand on the deployed commit of the open-source release, and later deploys count from it. <code>pnpm fred --version</code> prints a checkout's version: its tag, or the next version as a prerelease such as <code>0.3.2-dev.4+g1a2b3c4</code>, four changes past <code>v0.3.1</code>, with <code>.dirty</code> appended for uncommitted changes.</p>
+<p>Release notes list each title with its author and MR reference under Breaking changes, Features, Fixes, or Other changes, then link the comparison with the previous tag. Fixes include <code>perf</code> and GitLab's revert titles. Reading the merge commits needs no API token.</p>
+<p>The deployed version is visible in the admin UI next to the wordmark, on each review in <strong>Reviews</strong>, in the export's <code>manifest.json</code>, on <code>reviewJobs</code>, <code>usageEvents</code>, and transcripts as <code>fredVersion</code>, and at the end of each summary comment.</p>
+<p>The canonical repository and its CI live on FREI's GitLab. Maintainers publish a deployed release to the public mirror on GitHub by hand, as one commit titled <code>chore: publish vX.Y.Z</code> and tagged with the release, so internal MR titles stay internal. <code>git archive</code> builds that tree, so paths marked <code>export-ignore</code> in <code>.gitattributes</code>, FREI's own deployment and archives, stay out. The mirror's history starts at its first published commit. The mirror runs no CI; a maintainer lands an accepted pull request through a GitLab MR, whose pipeline checks it.</p>
+
+<h2 id="spend-limits">Spend and validation limits</h2>
+<p>The server reads each developer's monthly spend from the <code>usageMonthly</code> rollup, which <code>recordUsage</code> maintains alongside the <code>usageEvents</code> ledger. The budget owner is normally the MR author, or the triggering human for a bot-authored MR. Checks run at enqueue and claim; they do not stop a running review.</p>
+<p>New costs use OpenRouter's reported response costs. Historical rows retain their original accounting method. There is no account-bill reconciliation. Failed runs can have incomplete usage, marked on the job. The rollups include all rows without resolving <code>supersedes</code> corrections. The dashboard query in <a href="run-locally.html#monthly-spend">View monthly spend</a> sums the ledger directly; after the rollup backfill it agrees with the server's number to within half a micro-dollar per ledger row, well under a cent, because the rollup rounds each row before summing.</p>
+<p>CI uses offline fixtures. Its deployment checks prove controller access and worker connection, not provider compatibility or successful review publication. Agents may run explicit live provider checks through the isolated local Docker command. CI remains synthetic.</p>
+
+<h2 id="env">Environment</h2>
+<p><code>pnpm run setup</code> runs the interactive setup wizard. It labels required and optional inputs, captures secrets without echoing them, and retains saved values on Enter. It generates <code>FRED_TOKEN_KEY</code> unless one is saved and explains connecting each project's <code>0 FRED</code> token in the admin UI and adding its webhook. Final worker settings are checked against the actual worker configuration schema without starting services. Fixture startup remains disabled if its explicit live opt-in is skipped.</p>
+<p>The wizard saves deployment credentials in <code>apps/controller/.env.local</code>, controller runtime values in <code>apps/controller/.env.runtime</code>, worker values in <code>apps/worker/.env</code>, and local Docker settings in <code>apps/controller/self-hosted/.env</code>. Files have mode <code>0600</code>. Existing unrelated values are retained; file formatting is normalized. Setup values must be single-line and cannot contain single quotes.</p>
+<p>The controller runtime file is a local copy, not an automatic Convex env source. After a separate target-specific confirmation, the wizard applies those values to the self-hosted controller and reads them back. Admin and provider keys are excluded from that update. Applying refuses to replace a different <code>FRED_TOKEN_KEY</code> already on the controller, because the stored project tokens would become unreadable. Setup makes no GitLab requests, does not call model APIs, and does not start reviews.</p>
+<h3>Self-hosted backend and deployment</h3>
+<table>
+<tr><th>Variable</th><th>Meaning</th></tr>
+<tr><td><code>CONVEX_SELF_HOSTED_URL</code>, <code>CONVEX_SELF_HOSTED_ADMIN_KEY</code></td><td>Required deployment endpoint and admin credential in <code>apps/controller/.env.local</code>.</td></tr>
+<tr><td><code>REV</code>, <code>DASHBOARD_REV</code></td><td>Backend image revision and optional dashboard override. Defaults come from the backend template.</td></tr>
+<tr><td><code>INSTANCE_SECRET</code>, <code>INSTANCE_NAME</code></td><td>Required 64-character hex instance secret and optional instance name, default <code>fred</code>. Preserve the secret for an existing database.</td></tr>
+<tr><td><code>PORT</code>, <code>SITE_PROXY_PORT</code>, <code>DASHBOARD_PORT</code></td><td>Optional published ports. Defaults: 3210 for the backend, 3211 for HTTP actions, 6791 for the dashboard.</td></tr>
+<tr><td><code>CONVEX_CLOUD_ORIGIN</code>, <code>CONVEX_SITE_ORIGIN</code>, <code>NEXT_PUBLIC_DEPLOYMENT_URL</code></td><td>Optional public backend, HTTP action, and dashboard client target URLs. Empty values use the Compose localhost defaults.</td></tr>
+<tr><td><code>POSTGRES_URL</code></td><td>Optional database connection URL. Empty uses SQLite. Postgres setup is described in the upstream self-hosting guide.</td></tr>
+<tr><td><code>DO_NOT_REQUIRE_SSL</code></td><td>Optional database TLS override. Unset defaults to <code>true</code>; an explicitly empty value requires TLS. Convex treats every nonempty value as allowing connections without TLS, including <code>false</code>, which the wizard rejects. SQLite is unaffected.</td></tr>
+<tr><td><code>APPLICATION_MAX_CONCURRENT_MUTATIONS</code>, <code>APPLICATION_MAX_CONCURRENT_NODE_ACTIONS</code>, <code>APPLICATION_MAX_CONCURRENT_QUERIES</code>, <code>APPLICATION_MAX_CONCURRENT_V8_ACTIONS</code></td><td>Optional backend execution limits, each defaulting to 64.</td></tr>
+<tr><td><code>DOCUMENT_RETENTION_DELAY</code></td><td>Optional historical document retention in seconds. Default 172800, or two days.</td></tr>
+<tr><td><code>DISABLE_METRICS_ENDPOINT</code>, <code>RUST_LOG</code></td><td>Optional metrics and logging controls. Defaults: <code>true</code> and <code>info</code>.</td></tr>
+<tr><td><code>DISABLE_BEACON</code></td><td>The wizard fixes this to <code>true</code> to disable backend telemetry.</td></tr>
+</table>
+<h3>Controller</h3>
+<table>
+<tr><th>Variable</th><th>Meaning</th></tr>
+<tr><td><code>FRED_MAINTENANCE_MODE</code></td><td>Optional. Exactly <code>true</code> declines new review requests and queued analysis at claim with a maintenance comment. Unset, <code>false</code>, and other values leave maintenance off. Set on the self-hosted Convex deployment, not in the worker environment. See <a href="run-locally.html#maintenance-mode">Enable maintenance mode</a>.</td></tr>
+<tr><td><code>WORKER_SECRET</code></td><td>Required shared secret for every public worker query and mutation.</td></tr>
+<tr><td><code>ADMIN_SECRET</code></td><td>Credential for admin queries and writes: connecting, checking, and disconnecting projects, saving pipelines, refreshing the catalog, switching transcript collection, and downloading transcripts. One admin, no roles. Never grants worker access.</td></tr>
+<tr><td><code>GITLAB_WEBHOOK_SECRET</code></td><td>Secret token GitLab sends with every webhook call as <code>X-Gitlab-Token</code>, compared without early exit.</td></tr>
+<tr><td><code>GITLAB_URL</code></td><td>Base URL of the GitLab instance. Token checks, label creation, MR notes, and finding-command verification call its REST API. An unset value or one with credentials, query, or fragment counts as invalid configuration, and the admin UI then gets no MR links.</td></tr>
+<tr><td><code>FRED_TOKEN_KEY</code></td><td>Required. 32 random bytes in base64, as <code>openssl rand -base64 32</code> prints. Seals and opens the stored project access tokens. Keep it with the database; a different key makes every stored token unreadable. The setup wizard and pilot deployment create it when missing and never replace it.</td></tr>
+<tr><td><code>BOT_USER_IDS_OTHER</code></td><td>Comma-separated GitLab user ids of bots outside FRED that author MRs, like Renovate. Creation and pushes on their MRs never trigger; the human who adds the reviewer pays. Their notes never count as finding commands. Optional.</td></tr>
+</table>
+<p>The controller no longer reads <code>BOT_USER_ID_CLAUDE</code>, <code>BOT_USER_ID_CODEX</code>, <code>GITLAB_BOT_TOKEN_CLAUDE</code>, <code>GITLAB_BOT_TOKEN_CODEX</code>, or <code>GITLAB_BOT_SCOPES</code>, and the worker reads no GitLab token. Operators may delete those variables from the controller configuration and the worker environment files.</p>
+<h3>Admin UI</h3>
+<p>The static bundle talks to Convex on its own origin, which nginx proxies under <code>/api</code>. Only development needs a variable.</p>
+<table>
+<tr><th>Variable</th><th>Meaning</th></tr>
+<tr><td><code>VITE_CONVEX_URL</code></td><td>Development only. The controller URL printed by <code>pnpm fred dev up</code>. Unset in production builds.</td></tr>
+</table>
+<h3>Worker</h3>
+<p><code>pnpm --filter @fred/worker start</code> loads the optional <code>apps/worker/.env</code> file. Exported environment values take precedence. This command requires Node 22.9 or newer.</p>
+<table>
+<tr><th>Variable</th><th>Meaning</th></tr>
+<tr><td><code>WORKER_SECRET</code></td><td>Same secret as the controller. Sent as <code>workerSecret</code> on every job query and mutation.</td></tr>
+<tr><td><code>CONVEX_URL</code></td><td>The self-hosted backend's <code>CONVEX_CLOUD_ORIGIN</code>.</td></tr>
+<tr><td><code>GITLAB_URL</code></td><td>Clone, read MR data, post reviews, set labels. Each request uses the project access token the claim returns; the worker environment holds no GitLab token.</td></tr>
+<tr><td><code>OPENROUTER_API_TOKEN</code></td><td>One OpenRouter token for all model requests, dedicated to this service. Public model discovery requires no token.</td></tr>
+<tr><td><code>FRED_RELEASE_SHA</code></td><td>Optional full Git commit SHA for diagnostic correlation. Deployment sets it in the worker service drop-in. A value that is not 40 lowercase hex characters is ignored.</td></tr>
+<tr><td><code>FRED_VERSION</code></td><td>Optional SemVer <a href="#versioning">release version</a>. Deployment sets it in the worker service drop-in. The worker stamps it on saved results, usage rows, and transcripts, and signs the summary comment with it. An empty value counts as unset; an invalid value stops the worker at startup.</td></tr>
+<tr><td><code>WORKER_CONCURRENCY</code></td><td>Parallel jobs across different MRs in this process. Default 8.</td></tr>
+<tr><td><code>FRED_DEV_ONLY</code></td><td>Generated as <code>1</code> only in local development containers. Enables the injected fixture controller functions and local review runner.</td></tr>
+<tr><td><code>FRED_DEV_SOURCE_HASH</code></td><td>Generated SHA-256 source snapshot identity returned by local verification and inspection.</td></tr>
+<tr><td><code>AI_REVIEW_LIVE</code></td><td>Must equal <code>1</code> for an authorized fixture worker. The local Docker runner calls models only through an explicit <code>--live openrouter</code> request. Tier one and tier two tests use fake layers and transports.</td></tr>
+<tr><td><code>WORKER_MODE</code></td><td><code>fixture</code> by default. Requires a controller on localhost and explicit fixture project IDs. <code>service</code> is an explicit operator choice for authorized deployment.</td></tr>
+<tr><td><code>WORKER_FIXTURE_PROJECT_IDS</code></td><td>Comma-separated GitLab project IDs permitted in fixture mode. Required in fixture mode. This mode restricts targets; it does not replace provider calls with recordings.</td></tr>
+</table>
+
+<h2 id="glossary">Glossary</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>release</td><td>A deployment of <code>main</code>, tagged <code>vX.Y.Z</code> with a GitLab Release and its stamped <code>release.tar.gz</code> in the package registry. <code>FRED_VERSION</code> and <code>fredVersion</code> carry its version. Older fields named <code>release</code> hold its commit SHA.</td></tr>
+<tr><td>public mirror</td><td>The public GitHub repository of FRED. Maintainers publish releases of <code>main</code> to it by hand. It holds no paths marked <code>export-ignore</code> and runs no CI. See <a href="#versioning">Versioning and releases</a>.</td></tr>
+<tr><td>bot identity</td><td>The GitLab user that owns a job's findings, labels, and comments, persisted as its provider. New work belongs to the FRED bot. Model vendor is independent of this identity.</td></tr>
+<tr><td>FRED bot</td><td>The bot user GitLab creates for a project's <code>0 FRED</code> project access token. Adding it as reviewer is the trigger. A project keeps every former FRED bot user ID so earlier discussions stay FRED's.</td></tr>
+<tr><td><code>0 FRED</code></td><td>The name admins give each project's FRED token, and so its bot user's display name. The leading 0 sorts it first in reviewer pickers.</td></tr>
+<tr><td>project access token</td><td>A GitLab token that belongs to one project and acts through its own bot user. FRED needs the <code>api</code> scope and at least the Developer role.</td></tr>
+<tr><td>forge</td><td>A code-hosting platform such as GitLab or GitHub. FRED supports one forge, GitLab, by decision, and has no forge abstraction.</td></tr>
+<tr><td>connected project</td><td>A project with a stored, sealed token and a review pipeline. Only connected projects trigger reviews.</td></tr>
+<tr><td>review pipeline</td><td>A project's model and effort for detection and validation, in <code>projects.stageModels</code>. Copied onto each job at enqueue.</td></tr>
+<tr><td>sealed token</td><td>A project access token encrypted with AES-256-GCM under the token vault key, bound to its GitLab project ID. Stored in <code>projectTokens.sealedToken</code>.</td></tr>
+<tr><td>token vault key</td><td><code>FRED_TOKEN_KEY</code>, the controller's 32-byte key that seals and opens project tokens.</td></tr>
+<tr><td>token check</td><td>A GitLab lookup of a stored token's metadata, bot user, project, and role, every six hours and on <strong>Check</strong>. A failure records a problem for the admin.</td></tr>
+<tr><td>retired bot</td><td>The shared Claude and Codex GitLab accounts that reviewed before project access tokens, persisted as providers <code>claude</code> and <code>codex</code>. Their history stays readable; they never trigger and their findings accept no commands.</td></tr>
+<tr><td>comment delivery</td><td>An <code>mrNotes</code> row with a stable key, attempt count, status, and hidden GitLab note marker.</td></tr>
+<tr><td>diagnostic event</td><td>Bounded operational metadata, retained for seven days by the controller and journaled by the worker. Failure events carry failure detail; no event contains prompts or tool results.</td></tr>
+<tr><td>failure detail</td><td>The redacted cause chain, bounded to 2,000 characters, attached to a classified failure. Shown in diagnostics, the admin UI, and the journal; never in MR comments.</td></tr>
+<tr><td>failure trace</td><td>The redacted rendering of a failure with every stack in its cause chain, bounded to 16 KiB. Written only to the worker journal.</td></tr>
+<tr><td>provider failure details</td><td>OpenRouter failures use the shared classification, safe code, and HTTP status. Unknown codes are recorded as <code>unknown</code>; raw messages appear only in the failure detail. Historical native-runtime source, code, and RPC code stay readable through the stored schemas.</td></tr>
+<tr><td>stored schema</td><td>A contracts schema that reads history: <code>readReviewResult</code>, <code>storedDiagnosticEvent</code>, and <code>storedDiagnosticSnapshot</code>. It accepts what retired code wrote; the matching write schema rejects it.</td></tr>
+<tr><td>diagnostic snapshot</td><td>Compact progress and failure metadata associated with a review job. Worker snapshots are stored separately from lifecycle state.</td></tr>
+<tr><td>maintenance agent</td><td>An agent investigating a FRED deployment through its logs and the controller's records, read-only unless an operator authorizes more. Separate from the sandboxed provider review agent.</td></tr>
+<tr><td>provider</td><td>The persisted bot key, <code>fred</code> for new work or the retired <code>claude</code> and <code>codex</code>, used for policy and finding ownership. One OpenRouter <code>ReviewProvider</code> layer serves the FRED bot. An OpenRouter upstream provider is a model route, not this bot key.</td></tr>
+<tr><td>controller</td><td>The self-hosted Convex deployment. Webhook, policy, queue, ledger, findings, crons.</td></tr>
+<tr><td>Docker stack</td><td>The Compose project in <code>docker/</code> that runs the backend, deploy job, worker, dashboard, and web server on one host.</td></tr>
+<tr><td>deploy job</td><td>The Docker stack's one-shot <code>deploy</code> service. Brings the controller to its image's functions and the stack's configuration before the worker starts.</td></tr>
+<tr><td>setup wizard</td><td>The interactive <code>pnpm run setup</code> command that gathers and validates configuration for the backend, controller, and worker.</td></tr>
+<tr><td>worker</td><td>The Effect process that claims reviews and finding commands, runs review agents, and publishes stored effects.</td></tr>
+<tr><td>agent</td><td>The worker's OpenRouter conversation for one stage. It receives controlled checkout tools and no worker credentials.</td></tr>
+<tr><td>transcript</td><td>One stage attempt's full model conversation, offered tools, and per-response metadata, stored redacted as a gzipped JSON file with a <code>transcripts</code> row. Keyed by job, lease generation, and stage. Carries no developer identity.</td></tr>
+<tr><td>transcript collection</td><td>The per-project switch <code>projects.collectTranscripts</code>, off by default and copied onto each new job at enqueue. Changed on the admin UI's Projects page through <code>admin.setTranscriptCollection</code>, or through <code>transcripts:setCollection</code>.</td></tr>
+<tr><td>data export</td><td>One archive of everything the controller stores, assembled by the admin UI: <code>manifest.json</code> naming the deployed <code>fredVersion</code>, one <code>tables/&lt;table&gt;.jsonl</code> per exported table read through <code>admin.exportPage</code>, and one <code>transcripts/&lt;id&gt;.json.gz</code> per available transcript file read through <code>admin.downloadTranscript</code>. Contains source code and developer identities, never project tokens, lease secrets, or storage IDs.</td></tr>
+<tr><td>job</td><td>One review of one MR head sha by one provider. Row in <code>reviewJobs</code>.</td></tr>
+<tr><td>dedupe key</td><td>The project, MR, SHA, and provider identity used for ordinary trigger dedupe. A fresh deliberate re-request can create a separate attempt after outstanding work finishes; webhook delivery keys still reject replay.</td></tr>
+<tr><td><code>mr_opened</code></td><td>The controller trigger for a bot reviewer assigned when a human-authored MR is created. Requests an initial review, including on drafts, without authorizing failed-review recovery.</td></tr>
+<tr><td>supersede</td><td>A push replaces queued jobs for that MR and provider. Publication stops when its head or finding revision is outdated.</td></tr>
+<tr><td>claim</td><td>The atomic mutation that grants one worker a lease for a review, finding command, or saved publication.</td></tr>
+<tr><td>gate</td><td>One policy check. Order: maintenance mode, global disabled, developer blocked, project denies provider, budget reached.</td></tr>
+<tr><td>maintenance mode</td><td>A controller environment flag that declines new requests and queued analysis with a maintenance comment. Running analysis and saved publication continue.</td></tr>
+<tr><td>denial comment</td><td>The one-line MR comment a gate or a failure posts as the project's FRED bot.</td></tr>
+<tr><td>budget owner</td><td>The developer charged for a job. The MR author, or the person who added the reviewer on a bot-authored MR.</td></tr>
+<tr><td>month</td><td>The <code>yyyy-mm</code> bucket on each usage row, computed at write time in the org timezone.</td></tr>
+<tr><td>day</td><td>The <code>yyyy-mm-dd</code> bucket on each usage row, computed at write time in the org timezone. Drives the daily spend chart.</td></tr>
+<tr><td>lab</td><td>The model author, the segment before the slash in an OpenRouter model ID such as <code>anthropic/claude-fable-5.1</code>. Usage rows from before OpenRouter take it from the bot identity. Spend is summarized and charted per lab in the lab's brand color.</td></tr>
+<tr><td>working day</td><td>Monday to Friday. The burn rate divides month spend by elapsed working days.</td></tr>
+<tr><td>diff catalog</td><td>Job-local index of verified full and incremental diff ranges, with stable entry IDs, a complete inline or paged manifest, and bounded read access for both model stages.</td></tr>
+<tr><td>review failure</td><td>One append-only <code>reviewFailures</code> row: a job failure, a denial at claim or enqueue, or a comment GitLab never accepted. Survives recovery and diagnostic pruning.</td></tr>
+<tr><td>admin</td><td>The single operator of the admin UI, authenticated by <code>ADMIN_SECRET</code>. Reads operational data, connects projects, and saves their review pipelines.</td></tr>
+<tr><td>stage</td><td>One agent run inside a job. Stage 1 detects candidates, stage 2 validates them.</td></tr>
+<tr><td>candidate</td><td>A stage 1 output before validation.</td></tr>
+<tr><td>finding</td><td>A candidate after Stage 2. Publication status retains pending, posted, rejected, and duplicate outcomes. Current disposition records whether a published finding remains open.</td></tr>
+<tr><td>disposition</td><td>A finding's current lifecycle value: open, fixed, dismissed, or retracted. Separate from publication status.</td></tr>
+<tr><td>finding decision</td><td>An append-only record of a disposition change, its reason, actor, source, and available publication references.</td></tr>
+<tr><td>finding command receipt</td><td>A durable copy of a parsed human command awaiting asynchronous authorization. Keyed by project and GitLab note ID.</td></tr>
+<tr><td>finding command</td><td>A verified human dismiss or undo request, stored separately from reviews and processed under the same MR exclusion.</td></tr>
+<tr><td>finding reference</td><td>A stable published address for a finding. New findings use the review job ID and result index, separated by <code>/</code>.</td></tr>
+<tr><td>decision reference</td><td>A published address for a finding decision. Undo must target the current dismissal or retraction.</td></tr>
+<tr><td>finding revision</td><td>The latest disposition-changing decision ID for an MR and provider. Migration-only provenance does not advance it. Prevents a saved review from publishing obsolete disposition or label effects.</td></tr>
+<tr><td>actionable finding</td><td>A posted, open blocking or should-fix finding. The same selection determines remaining counts and provider labels.</td></tr>
+<tr><td>sanity bound</td><td>A 45-minute deadline per model stage. Timeout fails the review. There is no call-count bound.</td></tr>
+<tr><td>usage event</td><td>An append-only observed usage delta with a stable event key, cost, tokens, model, accounting version in <code>priceTableVersion</code>, and month.</td></tr>
+<tr><td>rollup</td><td>A running sum of usage events, kept in <code>usageDaily</code> per day, provider, and model and in <code>usageMonthly</code> per month and budget owner. Written in the same transaction as the ledger row. Cost is integer micro-dollars.</td></tr>
+<tr><td>first usage day</td><td>The day of a job's first priced usage row, stored as <code>reviewJobs.firstUsageDay</code>. The job counts as one review in that day's and month's rollup and nowhere else.</td></tr>
+<tr><td>model catalog</td><td>A stored snapshot of OpenRouter models with text and tool support, context limits, supported parameters, and reasoning metadata. Refreshed through the official SDK.</td></tr>
+<tr><td>stage selection</td><td>A model and effort pair for detection or validation, copied from the project's review pipeline onto a review job when it enters the queue.</td></tr>
+<tr><td>reported cost</td><td>The USD cost returned by OpenRouter for a model response. New usage rows identify this accounting method with <code>priceTableVersion: "openrouter-reported-v1"</code>.</td></tr>
+<tr><td>prompt caching</td><td>Reuse of a model request's input prefix across later requests. Every model request enables it; OpenRouter reports cache usage and cost.</td></tr>
+<tr><td>review instructions</td><td>Root <code>REVIEW.md</code> at the reviewed SHA. It takes precedence over general repo conventions for review rules and can reference repo skills.</td></tr>
+<tr><td>local development instance</td><td>A worktree-specific Docker Compose project containing a controller, review runner, dashboard, and persistent local fixture results.</td></tr>
+<tr><td>source snapshot</td><td>The copied worktree files used to build a local development image, identified by a SHA-256 content hash.</td></tr>
+<tr><td>fixture</td><td>A scrubbed recording or explicitly synthetic input used in offline tests. Model responses in the worker tests are synthetic.</td></tr>
+<tr><td>split rename</td><td>A rename the raw diff endpoint prints as one deletion section and one addition section instead of one rename section.</td></tr>
+<tr><td>hunk-less section</td><td>A raw diff section with only Git extended headers and no <code>@@</code> hunks: an unchanged rename, an empty file addition or deletion, a mode-only change, or a binary change.</td></tr>
+<tr><td>stand-in</td><td>A verified raw diff section rendered to the model in place of an omitted API patch. It carries no inline anchors; its findings appear in the summary only.</td></tr>
+<tr><td>publication effect</td><td>One immutable summary, finding, resolution, or label operation stored before publication.</td></tr>
+<tr><td>publication marker</td><td>The hidden <code>&lt;!-- fred-review:… --&gt;</code> comment the worker appends to each note it writes. It encodes the marker key, the job or finding command ID and the effect key, in base64url. Defined in <code>packages/contracts/src/markers.ts</code> with the review labels.</td></tr>
+<tr><td>workspace</td><td>A job's checkout, walked once after cloning. Repository rules, the skill catalog, and both stages' tools read through it.</td></tr>
+<tr><td>publication acknowledgement</td><td>A controller record that a stored effect completed, including its discussion and note IDs when applicable. Delivery metadata preserves disposition. Explicit decision effects apply the corresponding audited transition.</td></tr>
+<tr><td>lease</td><td>Two-minute ownership of an active review or finding command, renewed by heartbeat and replaced on publication recovery. <code>lease.ts</code> grants and checks it for both.</td></tr>
+<tr><td>in-flight status</td><td><code>queued</code>, <code>running</code>, or <code>publishing</code>: a review or finding command that waits for or holds work. <code>inFlightStatuses</code> in <code>packages/contracts</code>.</td></tr>
+<tr><td>finished status</td><td><code>done</code>, <code>failed</code>, <code>denied</code>, <code>superseded</code>, or <code>skipped</code>: a review attempt that ended. <code>finishedStatuses</code> in <code>packages/contracts</code>.</td></tr>
+<tr><td>reconciliation</td><td>Searching GitLab for an effect's marker and a FRED bot author before repeating an uncertain write. Provider-bill reconciliation is outside MVP.</td></tr>
+<tr><td>skill</td><td>A repo <code>SKILL.md</code> and its reference files, loaded through controlled checkout tools.</td></tr>
+<tr><td>usage gap</td><td>Observed accounting is incomplete or reset. The job records the gap without estimating missing usage.</td></tr>
+</table>
+</main>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "base",
+    themeVariables: {
+      fontFamily: "ui-sans-serif, system-ui, sans-serif",
+      primaryColor: "#ffffff",
+      primaryTextColor: "#111",
+      primaryBorderColor: "#444",
+      secondaryColor: "#e8e8e8",
+      tertiaryColor: "#f4f4f4",
+      lineColor: "#222",
+      textColor: "#111",
+      background: "#fff",
+      clusterBkg: "#f0f0f0",
+      clusterBorder: "#999",
+      actorBkg: "#ffffff",
+      actorBorder: "#444",
+      noteBkgColor: "#fff8d6",
+      noteBorderColor: "#999",
+    },
+  });
+</script>
+</body>
+</html>

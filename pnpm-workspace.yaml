@@ -1,0 +1,8 @@
+packages:
+  - apps/*
+  - packages/*
+
+allowBuilds:
+  esbuild: true
+  '@openrouter/sdk': false
+  msgpackr-extract: false

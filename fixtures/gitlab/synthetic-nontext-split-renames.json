@@ -1,0 +1,12 @@
+[
+  {
+    "kind": "empty",
+    "deletion": "diff --git a/old.ts b/old.ts\ndeleted file mode 100644\nindex e69de29..0000000\n",
+    "addition": "diff --git a/new.ts b/new.ts\nnew file mode 100755\nindex 0000000..e69de29\n"
+  },
+  {
+    "kind": "binary",
+    "deletion": "diff --git a/old.ts b/old.ts\ndeleted file mode 100644\nindex b835d73..0000000\nBinary files a/old.ts and /dev/null differ\n",
+    "addition": "diff --git a/new.ts b/new.ts\nnew file mode 100755\nindex 0000000..b835d73\nBinary files /dev/null and b/new.ts differ\n"
+  }
+]

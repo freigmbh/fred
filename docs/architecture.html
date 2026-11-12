@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI review service: architecture and decisions</title>
+<style>
+:root { color-scheme: dark; }
+body { margin: 0; background: #000; color: #fff; font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; }
+main { max-width: 900px; margin: 0 auto; padding: 32px 20px 80px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 40px 0 10px; padding-top: 12px; border-top: 1px solid #222; }
+h3 { font-size: 15px; margin: 22px 0 6px; }
+p, li { max-width: 78ch; }
+ul, ol { padding-left: 22px; margin: 6px 0; }
+li { margin: 2px 0; }
+code { background: #111; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+pre { background: #0a0a0a; border: 1px solid #222; padding: 12px; overflow-x: auto; font-size: 13px; line-height: 1.45; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0 12px; font-size: 14px; }
+th, td { text-align: left; vertical-align: top; padding: 6px 10px; border-bottom: 1px solid #222; }
+th { color: #aaa; font-weight: 600; }
+.muted { color: #999; }
+.flow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0; }
+.flow span { border: 1px solid #333; padding: 3px 10px; border-radius: 4px; font-size: 13px; }
+.flow i { color: #666; font-style: normal; }
+a { color: #fff; }
+nav a { color: #bbb; text-decoration: none; margin-right: 14px; }
+nav a:hover { color: #fff; }
+pre.mermaid { background: #fff; border: 1px solid #ccc; border-radius: 4px; color: #111; padding: 16px; text-align: center; }
+pre.mermaid svg { max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<main>
+<h1>AI review service: architecture and decisions</h1>
+<p class="muted">Explanation. For facts to look up, read <a href="reference.html">the reference</a>. For setup, read <a href="setup-gitlab.html">how to set up GitLab</a> and <a href="run-locally.html">how to run the stack locally</a>.</p>
+
+<nav>
+<a href="#what">What it is</a>
+<a href="#goal">Goal</a>
+<a href="#buy">Why we build</a>
+<a href="#stack">Stack</a>
+<a href="#pipeline">Review pipeline</a>
+<a href="#budget">Budget</a>
+<a href="#decisions">Decisions</a>
+<a href="#scope">MVP boundary</a>
+</nav>
+
+<h2 id="what">What it is</h2>
+<p>Each GitLab project reviews through its own FRED bot, the bot user of a project access token named <code>0 FRED</code>. A developer adds <strong>0 FRED</strong> as reviewer on a merge request. The service reviews the MR, posts inline findings as that bot, charges the cost to the MR author's monthly budget, and reviews again on every push while the bot stays assigned. Each project chooses its own review pipeline from the compatible OpenRouter models.</p>
+<p>The controller, worker, and GitLab stay on company infrastructure. Model requests and public model discovery go to OpenRouter. The worker owns repository access and tool execution.</p>
+<pre class="mermaid">
+graph TB
+  subgraph GitLab
+    MR[Merge request]
+    Repo[Repo at head sha]
+  end
+  subgraph Controller["Controller, self-hosted Convex, apps/controller"]
+    Web["HTTP action /webhook/gitlab"] --> Policy["Policy: kill switch, monthly budget"]
+    Tokens[(projectTokens, sealed)]
+    Jobs[(reviewJobs)]
+    Ledger[(usageEvents)]
+    Findings[(findings)]
+  end
+  subgraph Worker["Worker, one Node process, apps/worker"]
+    Claim[Claim and lease] --> Clone[Exact-SHA checkout] --> S1[Stage 1 detect] --> S2[Stage 2 validate] --> Save[Save result] --> Post[Publish stored effects]
+  end
+  LLM["OpenRouter API"]
+  Controller -- "public model catalog" --> LLM
+  MR -- "reviewer added, re-requested, push" --> Web
+  Policy -- "sum this month" --> Ledger
+  Policy -- enqueue --> Jobs
+  Admin["Admin UI, Projects"] -- "connect token, choose pipeline" --> Tokens
+  Web -- "project's FRED bot" --> Tokens
+  Jobs -- "subscribe, atomic claim with project token" --> Claim
+  Repo --> Clone
+  S1 & S2 --> LLM
+  S1 & S2 -- "observed usage deltas" --> Ledger
+  Post -- "discussions, summary, label" --> MR
+  Save -- "all candidates with status" --> Findings
+  Post -- "acknowledge effects" --> Jobs
+</pre>
+<ul>
+<li>The <strong>controller</strong> is a self-hosted Convex deployment in <code>apps/controller/</code>. It receives the webhook, applies policy, holds the job queue, the usage ledger, the findings, and each project's sealed access token, and runs crons.</li>
+<li>The <strong>worker</strong> is an Effect program in <code>apps/worker/</code>, one Node process. It claims jobs, clones the MR head, runs both review stages through the official OpenRouter SDK, and posts the result to GitLab. Different MRs run in parallel inside one process. Work on the same MR runs in sequence. The worker holds no GitLab token of its own; each claim carries the project's token.</li>
+<li>The admin UI shows queue state, finished reviews, failures, and spend, and connects projects and edits their review pipelines. The self-hosted Convex dashboard exposes the stored records.</li>
+</ul>
+
+<h2 id="goal">Goal and how we know we reached it</h2>
+<p>The MVP has one goal. Developers find the reviews useful enough to keep adding <strong>0 FRED</strong> on their next MR. Budget control and pipeline reliability are constraints, not the goal. A perfectly gated budget on a tool nobody asks for is worth nothing.</p>
+<p>First users are one repo and a few developers, with the author of this service as the main user. Feedback is gathered in person. Nobody clicks thumbs on bot comments, so the MVP has no feedback tooling. The stored findings are the record. An agent can audit them later for what developers pushed back on.</p>
+<p>Offline tests establish handling of supplied responses and failures. Local live checks exercise the selected OpenRouter model against a known fixture. Real GitLab publication and evidence that developers find the reviews useful require their own checks.</p>
+
+<h2 id="buy">Why we build instead of buy</h2>
+<p>We checked the market on 2026-09-03. Macroscope, CodeRabbit, Graphite, Greptile, GitHub Copilot review, Anthropic's managed Claude Code Review, OpenAI's Codex review, GitLab Duo, Cursor Bugbot, Qodo, Ellipsis, Sourcery. Nothing off the shelf meets our constraint set at once: self-managed GitLab, everything except the model calls on our own infrastructure, API-key billing on two providers, and a per-developer budget. Macroscope has no GitLab support and no self-hosting. Codex review works on GitLab but bills through ChatGPT seats, not the API key. The tools that self-host, Greptile and CodeRabbit, do so on enterprise contracts sized for hundreds of seats.</p>
+<p>The market did settle several design questions for us, and the decisions below cite it.</p>
+<table>
+<tr><th>Finding</th><th>What we do with it</th></tr>
+<tr><td>Precision beats recall. Macroscope reports a jump from 75 to 98 percent precision after adding a strict validation pass behind a permissive detection pass. Anthropic's managed review runs parallel reviewers, then a verification step against the code. Qodo uses a judge agent. Cursor reports its biggest gain came from giving the reviewer tools rather than fixed passes.</td><td>Two stages in the MVP: detect, then validate. See <a href="#pipeline">the pipeline</a>.</td></tr>
+<tr><td>Repo rules matter most. Codex reports repo rules recover 98 percent of team-specific findings versus 58 percent without. Nearly every tool reads an instructions file, several read <code>AGENTS.md</code> or <code>CLAUDE.md</code> directly.</td><td><code>REVIEW.md</code> plus the repo's own agent file, from the MVP on.</td></tr>
+<tr><td>Severity gating is standard. Codex posts P0 and P1 only. Macroscope has a minimum severity. Anthropic caps nits per review.</td><td>Three severities, the top two inline, nits collapsed in the summary. Project rules can describe review priorities; the worker retains the three severity levels.</td></tr>
+<tr><td>Incremental re-review is standard. CodeRabbit, Bugbot, Ellipsis, Sourcery and Macroscope review each push and only the delta.</td><td>Re-review on every push, scoped to code changed since the bot's last review, in the MVP.</td></tr>
+<tr><td>Users turn tools off for noise, severity inflation, findings that are possible in theory but not in practice, hallucinated APIs from diff-only context, and false confidence from a green check.</td><td>Full repo checkout, not diff only. The bot never approves and never blocks.</td></tr>
+<tr><td>Pricing has moved to usage. Macroscope bills about one dollar per review, Bugbot one to one and a half, Anthropic's managed review 15 to 25 on frontier models.</td><td>Frontier models on both stages put us at the expensive end. The 3000 dollar monthly budget was calculated from real proof-of-concept runs and stays.</td></tr>
+<tr><td>Bigger model is not automatically the better reviewer. The Martian benchmark had Haiku beating Sonnet on F1. Macroscope mixes models per stage.</td><td>Recorded as a cost experiment, not a commitment.</td></tr>
+<tr><td>Almost nobody runs the tests. Only Ellipsis and GitLab Duo Flow execute in a sandbox.</td><td>Static review in the MVP. Repo skills can supply instructions and references, but cannot run tests or scripts.</td></tr>
+</table>
+
+<h2 id="stack">Stack</h2>
+<p>Convex for the controller, Effect for the worker. The split follows where the complexity sits. The controller is a database, a transactional job claim, crons, a webhook endpoint, and live subscriptions for the UI. Convex provides transactional mutations and subscriptions, so the application can keep ownership and publication state together.</p>
+<p>The worker composes subprocesses, deadlines, usage writes, and GitLab requests. Each can fail independently. Effect v4 puts expected failures in the error channel and binds subprocesses and temporary directories to scopes. The same finalizers run on success, failure, timeout, and interruption. These guarantees simplify worker control flow; fixture tests verify how the adapters respond at each boundary.</p>
+<p>Bus factor is the cost. Any TypeScript developer at the company reads Convex functions on day one. Effect takes weeks. The worker is small, and its agent file and the reference name every service, error, and layer, which is the mitigation.</p>
+<p>The contracts stay zod. The controller and the v1 UI consume them and neither runs Effect. The worker parses model output with the zod schema at the provider edge and lifts the result into an Effect.</p>
+<p>Convex is self-hosted from the first commit, including on the development laptop. Convex Cloud and the CLI's cloud login are never used. OpenRouter handles model requests and model discovery. All other service components stay on company infrastructure, including during development.</p>
+
+<h2 id="pipeline">Review pipeline</h2>
+<pre class="mermaid">
+sequenceDiagram
+  participant GL as GitLab
+  participant C as Controller
+  participant W as Worker
+  participant A as OpenRouter model
+  GL->>C: merge_request update
+  C->>C: verify token, detect trigger, dedupe
+  C->>C: policy: kill switch, month spend vs budget
+  alt denied
+    C->>GL: one-line comment as bot
+  else allowed
+    C->>C: supersede queued jobs for this MR, insert job
+    W->>C: claim, one atomic mutation
+    C->>C: policy again
+    C-->>W: job with the project's FRED token
+    W->>GL: MR metadata, complete diff, incremental diff, all discussions
+    W->>W: scoped exact-SHA checkout, REVIEW.md, conventions, skills
+    W->>A: stage 1 detect, read-only tools
+    A-->>W: candidates
+    W->>C: observed usage deltas
+    W->>A: stage 2 validate, same checkout plus candidates and discussions
+    A-->>W: accepted, rejected, duplicate, resolved
+    W->>C: observed usage deltas
+    W->>C: save validated findings and immutable effects
+    W->>GL: summary, inline findings, own-thread resolutions, label
+    W->>C: acknowledge each effect, complete
+  end
+</pre>
+<p><strong>Trigger.</strong> GitLab has no reviewer-added event, so the controller diffs the reviewers array on every merge request update and looks for the project's FRED bot. A push replaces queued jobs for the MR. Analysis already in progress can finish and store its results, but the worker stops new publication once it detects that the reviewed SHA is outdated. Serializing all work on one MR keeps reviews and human finding commands from racing on the same discussions and label.</p>
+<p><strong>Context.</strong> Controlled reads and searches over a full checkout, including repo skill discovery and loading. The agent has no shell, writes, external network tools, or worker credentials. Root <code>REVIEW.md</code> is the project review policy; referenced skills stay within those permissions. Whole-MR context, meaning every discussion and the bot's own previous findings, is what lets the bot see that a finding was rejected with a reason, or already fixed two pushes ago. That is the difference between a colleague and a linter.</p>
+<p><strong>Two stages.</strong> Stage 1 is permissive by design. Stage 2 rejects every candidate it cannot confirm in the code and drops what a human or another bot already raised. Rejected candidates are stored with the reason, so the validator's judgment can be audited.</p>
+<p><strong>Post.</strong> The summary is published first and contains every confirmed finding, including nits. Blocking and should-fix findings also go inline when GitLab accepts a valid diff position. The summary acknowledgement marks all displayed findings posted; inline acknowledgements add discussion IDs. This ordering preserves a visible finding if its inline anchor fails. When a push fixes a finding, the bot resolves its own thread. The scoped <code>fred-review::</code> label reflects all of FRED's unresolved actionable findings, including earlier reviews. A review with no new findings therefore does not erase an earlier unresolved finding. The bot never approves and never sets a blocking status, in every version.</p>
+<p>Each project has its own review pipeline: a model and effort for detection and for validation. The admin refreshes OpenRouter's public catalog and selects models with text and tool support. Model additions need no source change or worker restart. Reasoning options follow each model's metadata. Bot identity controls GitLab ownership, labels, and policy; it does not restrict the model vendor.</p>
+<p>Saving the project's pipeline on each queued job keeps a pipeline change from altering an active review. A fresh analysis retry takes the current pipeline; publication recovery keeps its completed result. Stage 2 validates candidates and cannot recover findings missed by stage 1.</p>
+
+<h2 id="budget">Budget model</h2>
+<p>One monthly number, configured globally, applied to each developer. The developer is the MR author. Whoever adds the reviewer is stored as the trigger, so the dashboard can show both. The check runs twice: when a job is enqueued and again when a worker claims it. Claim time is the last moment before money is spent, and it covers the case where ten queued reviews were all under budget when they were enqueued.</p>
+<p>There is no per-review dollar cap. A review that runs over the budget finishes. New reviews for that developer are denied until the month rolls over. The reasoning: a cap that stops a review halfway produces a worse review and the money is spent anyway. The monthly number is the brake.</p>
+<p>Each model stage has a 45-minute deadline. There is no model-call or tool-call count limit. The deadline bounds a stuck stage without introducing a per-review budget policy.</p>
+<p>There is no ignore list for lockfiles or generated code. Keeping the diff clean is the developer's job, and a committed <code>node_modules</code> is charged to the developer who committed it. The budget was sized from real proof-of-concept runs and has to absorb MRs that take twenty or more review rounds before merge.</p>
+<p>Every denial and every failed review queues a one-line comment on the MR as the project's FRED bot. The delivery record survives the job transaction and supports bounded retries. A hidden note marker prevents a retry from posting again after a lost response. Silent denials generate support tickets.</p>
+<p>OpenRouter bills the service account. The developer exists only in our ledger, so the ledger is the source of truth for budget checks. Each response supplies its cost and resolved model. This avoids maintaining token prices for every model and route. Missing usage or cost marks a gap while later known costs remain recordable. A crash or another consumer of the service token can still create a difference from the account bill. Bill reconciliation is outside this milestone.</p>
+
+<h2 id="decisions">Decisions and why</h2>
+<table>
+<tr><th>Decision</th><th>Reason</th></tr>
+<tr><td>One FRED bot per project, through a project access token</td><td>Two shared GitLab user accounts, Claude and Codex, were the first reviewers. They needed user accounts and licenses, Developer membership in every project, and one personal token each with access to everything the account could reach. A project access token creates its own bot user inside one project. No user account or license is involved, the token reaches only that project, and a Maintainer can revoke it there without touching other projects. The bot's identity and rights end at the project boundary, and the dashboard shows each token's role, scopes, expiry, and last check. One bot also removes the question of which bot to add: once either shared bot could run any OpenRouter model, two identities no longer separated model vendors.</td></tr>
+<tr><td>Tokens sealed in the controller, managed in the dashboard</td><td>A per-project token needs a place that knows the project. The controller already owns projects, the dashboard is where the admin works, and token checks, expiry warnings, and replacement belong next to the project's pipeline and health. The worker therefore has no GitLab token in its environment and receives the project's token with each claim; adding a project needs no worker restart or environment edit. Maintenance agents may read controller data, so tokens are sealed with AES-256-GCM under <code>FRED_TOKEN_KEY</code>, bound to the project ID. Only the authenticated worker claim and controller actions open them; admin functions return metadata only.</td></tr>
+<tr><td>Per-project review pipelines instead of global models per bot</td><td>With one bot, a global per-bot selection would force every project onto the same models. Projects differ in size, language, and budget appetite, so the pipeline lives with the project and is chosen when it is connected. A new project starts from a source default and has no fallback after that.</td></tr>
+<tr><td>Retired bots stay in the data</td><td>Claude and Codex jobs, findings, usage, and labels are review history and spend. Their provider keys stay readable, but they never trigger and their findings accept no commands, so FRED never edits another account's discussions.</td></tr>
+<tr><td>GitLab only, with no forge abstraction</td><td>FRED is built on GitLab's own model: a project access token as bot identity, reviewer assignment as the trigger, discussions anchored to the merge request diff, labels as the outcome, and raw diff recovery. GitHub covers the same ground with different primitives: App installations, check runs, and review comments placed by line and side. An abstraction drawn from one forge takes that forge's shape and leaks, so FRED would extract it twice. GitLab API calls belong at the edges, in the worker's <code>gitlab</code> module and the controller's <code>gitlab*.ts</code> files, so a second forge stays possible without paying for it now. A concrete need for one, not anticipation, is what reopens this decision.</td></tr>
+<tr><td>One OpenRouter adapter</td><td>One model API lets every project use compatible models without a separate runtime for each vendor.</td></tr>
+<tr><td>Trigger by reviewer assignment, not auto review on every MR</td><td>Opt-in means every review has someone who wanted it, which makes the usefulness question answerable. Auto review per project can become a policy option later.</td></tr>
+<tr><td>Inline findings plus a short summary</td><td>Inline is where the value is and where noise hurts most, so the MVP has to test it.</td></tr>
+<tr><td>No feedback tooling in the MVP</td><td>Developers will not click thumbs or resolve threads to train a bot. Feedback is in person. Stored findings allow an audit later.</td></tr>
+<tr><td>Validator in the MVP, not v1</td><td>The first twenty reviews decide whether colleagues keep adding the bot. Noise is what loses that bet. The validator is one extra call with a fixed prompt.</td></tr>
+<tr><td>Labels instead of approval</td><td>A bot approval lets a human skip the review, which is the opposite of what leadership pays for. A label carries the outcome without granting anything.</td></tr>
+<tr><td>Project webhooks and project tokens</td><td>Maintainers opt in each project by creating its <code>0 FRED</code> token and a project webhook; the admin connects the token. Token, bot, and event delivery stay at project scope. Connecting creates the review labels as project labels when no group label exists, so onboarding needs no group administrator.</td></tr>
+<tr><td>Bot-authored MRs need a human trigger, and that human pays</td><td>Renovate and release tooling should not spend budget on their own.</td></tr>
+<tr><td>Effect for the worker, plain Convex for the controller</td><td>The worker is where failure paths compose: subprocess, deadline, cleanup, partial usage writes, provider errors. Effect puts each on the type and runs the cleanup on every exit path. The controller has no such paths, and Effect inside Convex functions would add weight for nothing.</td></tr>
+<tr><td>Frontier models on both stages</td><td>Know what the best case looks like before optimising cost.</td></tr>
+<tr><td>Findings stored from day one, including validator rejects</td><td>Raw material for every later quality feature. Not storing them means the first twenty reviews are lost data.</td></tr>
+<tr><td>Transcript collection, opt-in per project, in Convex file storage</td><td>Tuning prompts and models against findings, validator rejects, and human decisions needs the conversation behind each stage, which otherwise ends with it. A transcript holds the source code the agent read, so a project opts in deliberately, and the job snapshots the switch at enqueue like its model selections, so a review never changes mid-flight. The worker uploads through an authenticated action over its existing controller connection: upload URLs point at the HTTP action origin, which the worker may not reach, and worker disk would keep the evidence away from the job record and the admin UI. Downloads go through an admin action because storage URLs need no credential. Every string is redacted with the failure-detail rule, and the file names no developer; the job ID is the join key. Storing is best-effort, so a lost transcript is a visible gap, never a failed review. Evaluation data is only useful as it accumulates, so transcripts stay until an operator deletes them; unlike findings, they may be deleted.</td></tr>
+<tr><td>Docs as HTML for people, markdown for agents, Mermaid diagrams in both</td><td>Agents read <code>AGENTS.md</code> from the repo and can read Mermaid source. People get the rendered diagram. The Mermaid loader is the only external script, and the diagram source stays readable as text when it does not load.</td></tr>
+</table>
+
+<h2 id="scope">MVP boundary</h2>
+<p>The worker uses Effect v4 and the official OpenRouter SDK. FRED owns the conversation loop, exposes its controlled repository tools, and validates the final <code>submit_review</code> call against the shared stage schema. It needs no vendor CLI, provider subprocess, runtime home, or credential proxy. Compatibility depends on model capabilities and observed behavior, not on a vendor-specific runtime.</p>
+<p>Root <code>REVIEW.md</code> and repo skills provide project-specific review behavior. Missing instructions add a tip; missing skills add a hint. Both stages continue with available rules. Project files cannot grant shell access, enable hooks or subagents, select credentials, or change the review pipeline and budget settings.</p>
+<p>A 45-minute deadline per stage is the runaway guard. There is no model-call count, tool-call count, or per-review dollar cap. The worker records observable usage and flags gaps because a terminated provider session can spend money without delivering a final usage event. The monthly ledger is recorded spend, not a guaranteed provider bill.</p>
+<p>Publication progress belongs in the controller. Persisting validated findings and effects before posting makes a worker restart recoverable without repeating paid analysis. Stable GitLab markers let the worker reconcile an accepted request whose response was lost. There is still no transaction across GitLab and Convex.</p>
+<p>The controller owns a two-minute lease for each active review. Heartbeats keep it alive. An expired analysis fails and needs a deliberate re-request; expired publication is reclaimed from its stored result. A controller outage pauses new claims and publication, then interrupts analysis after bounded reconnection attempts. The worker stays alive to recover when its controller returns.</p>
+<p>Agents may exercise OpenRouter through the isolated local Docker verifier. That command uses a fixture checkout and captures GitLab effects. Reviews against a real GitLab fixture project require human authorization, localhost Convex, explicit project IDs, and <code>AI_REVIEW_LIVE=1</code>. Shared deployment, bill reconciliation, executable review skills, and browser review remain separate work.</p>
+<h2 id="diagnostics">Why maintenance agents read the deployment directly</h2>
+<p>A failed review is useful operational evidence only if maintenance agents can trace it to a stage, a cause, and a deployed release. Diagnostic events cover webhook decisions before a job exists as well as worker and publication activity. Compact snapshots keep the current job explanation available after detailed events expire.</p>
+<p>A classification alone rarely explains a failure. <code>provider</code> without the finish reason, or <code>gitlab</code> without the API path and response, sends the investigator back to guessing. Each failure therefore keeps its redacted cause chain as detail, and the journal keeps the stacks. Credentials are the one thing diagnostics must never hold, so redaction removes configured secret values and known credential shapes at write time. MR comments keep the classified summary, because their audience is broader than the deployment’s operators.</p>
+<p>A forced SSH command limited to allowlisted metadata would keep repository content off the maintenance path, but investigations need logs, host state, and upstream errors that such a command cannot return. Agents use ordinary SSH and read journals, logs, host state, and the controller through the deployed release’s CLI. Their authority is read-only by rule rather than by mechanism; restarts, deployments, retries, and writes still need an operator.</p>
+<p>Diagnostic storage is best-effort. A recording failure must not break a working review, and outage recovery does not justify a second durable queue here. The worker journal is the complete local timeline, so controller drops lose convenience, not evidence. Seven-day event retention limits detailed storage; compact failures remain with jobs. Reports name their gaps rather than claim a complete event history.</p>
+<p>Every controller write is one SQLite commit, and on the disk of FREI’s first deployment a commit costs tens of milliseconds to seconds. Liveness writes are the steady load, so they stay sparse: heartbeats renew the two-minute lease every 30 seconds, diagnostics flush every ten seconds and skip snapshots that only move the activity time within a minute, and tool events stay in the journal. The admin queue flags silence only after five minutes, so this lag cannot raise the flag early; the journal keeps exact times.</p>
+
+</main>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "base",
+    themeVariables: {
+      fontFamily: "ui-sans-serif, system-ui, sans-serif",
+      primaryColor: "#ffffff",
+      primaryTextColor: "#111",
+      primaryBorderColor: "#444",
+      secondaryColor: "#e8e8e8",
+      tertiaryColor: "#f4f4f4",
+      lineColor: "#222",
+      textColor: "#111",
+      background: "#fff",
+      clusterBkg: "#f0f0f0",
+      clusterBorder: "#999",
+      actorBkg: "#ffffff",
+      actorBorder: "#444",
+      noteBkgColor: "#fff8d6",
+      noteBorderColor: "#999",
+    },
+  });
+</script>
+</body>
+</html>

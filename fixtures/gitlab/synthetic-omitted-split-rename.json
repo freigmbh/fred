@@ -1,0 +1,24 @@
+{
+  "diffs": [
+    {
+      "diff": "",
+      "new_file": false,
+      "renamed_file": true,
+      "deleted_file": false,
+      "old_path": "old.ts",
+      "new_path": "new.ts"
+    },
+    {
+      "diff": "@@ -1 +1 @@\n-old\n+new\n",
+      "new_file": false,
+      "renamed_file": false,
+      "deleted_file": false,
+      "old_path": "lock.yaml",
+      "new_path": "lock.yaml"
+    }
+  ],
+  "deletion": "diff --git a/old.ts b/old.ts\ndeleted file mode 100644\nindex 1234567..0000000\n--- a/old.ts\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-first\r\n-last\n\\ No newline at end of file\n",
+  "addition": "diff --git a/new.ts b/new.ts\nnew file mode 100644\nindex 0000000..abcdef0\n--- /dev/null\n+++ b/new.ts\n@@ -0,0 +1,2 @@\n+first\r\n+changed\n\\ No newline at end of file\n",
+  "lockfile": "diff --git a/lock.yaml b/lock.yaml\n--- a/lock.yaml\n+++ b/lock.yaml\n@@ -1 +1 @@\n-old\n+new\n",
+  "emptyDeletion": "diff --git a/old.ts b/old.ts\ndeleted file mode 100644\nindex e69de29..0000000\n"
+}

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to set up GitLab for the AI review service</title>
+<style>
+:root { color-scheme: dark; }
+body { margin: 0; background: #000; color: #fff; font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; }
+main { max-width: 900px; margin: 0 auto; padding: 32px 20px 80px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 40px 0 10px; padding-top: 12px; border-top: 1px solid #222; }
+p, li { max-width: 78ch; }
+ul, ol { padding-left: 22px; margin: 6px 0; }
+li { margin: 4px 0; }
+code { background: #111; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+pre { background: #0a0a0a; border: 1px solid #222; padding: 12px; overflow-x: auto; font-size: 13px; line-height: 1.45; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0 12px; font-size: 14px; }
+th, td { text-align: left; vertical-align: top; padding: 6px 10px; border-bottom: 1px solid #222; }
+th { color: #aaa; font-weight: 600; }
+.muted { color: #999; }
+a { color: #fff; }
+</style>
+</head>
+<body>
+<main>
+<h1>How to set up GitLab for the AI review service</h1>
+<p class="muted">How-to. Each project reviews through its own FRED bot, the bot user of a project access token named <code>0 FRED</code>. A project Maintainer creates the token and the webhook; the FRED admin connects the token in the admin UI. For configuration details, read <a href="reference.html#projects">the reference</a>.</p>
+
+<h2 id="create-token">Create the 0 FRED project access token</h2>
+<ol>
+<li>As project Maintainer, open the project's <strong>Settings &gt; Access tokens</strong> and add a new token.</li>
+<li>Name it <code>0 FRED</code>. GitLab shows the token's bot user under this name, and the leading 0 sorts it first in reviewer pickers.</li>
+<li>Select the <strong>Developer</strong> role or higher and the <code>api</code> scope. Choose an expiry date that suits your rotation policy.</li>
+<li>Create the token and copy its value. GitLab shows it only once.</li>
+</ol>
+<p>Create a project access token, not a personal or group token. FRED refuses a token that belongs to a person or reaches more than one project.</p>
+
+<h2 id="connect-project">Connect the project in the admin UI</h2>
+<ol>
+<li>Log in to the FRED admin UI and open <strong>Projects</strong>. Click <strong>Connect</strong>.</li>
+<li>In the <strong>Setup</strong> tab, paste the token.</li>
+<li>The line below the token names the review pipeline Connect saves, starting from the default. To change it, click <strong>Change</strong> and choose the model and effort for detection and validation in the <strong>Review</strong> tab. If the model list is empty, click <strong>Refresh</strong> under the panes.</li>
+<li>Back in <strong>Setup</strong>, click <strong>Connect</strong>. FRED checks the token with GitLab, finds the project from the token, creates any missing review labels, stores the token sealed, and sets FRED's face as the bot's avatar.</li>
+</ol>
+<p>The project appears in the list. Its <strong>Setup</strong> tab shows the token's bot user, role, expiry, last check, and scopes. If the check fails, the form names the problem, such as a missing <code>api</code> scope or a role below Developer. Fix the token in GitLab and connect again.</p>
+<p>FRED sets these scoped labels. Connecting creates the missing ones as project labels; an existing project or group label with the same name also works. Keep their names unchanged. The worker never creates labels.</p>
+<table>
+<tr><th>Label</th><th>Set when</th></tr>
+<tr><td><code>fred-review::clean</code></td><td>FRED has no posted, open blocking or should-fix finding.</td></tr>
+<tr><td><code>fred-review::findings</code></td><td>FRED has at least one posted, open blocking or should-fix finding.</td></tr>
+</table>
+<p>Scoped labels with the same prefix replace each other, so an MR carries one FRED label.</p>
+
+<h2>Add a webhook to the project</h2>
+<ol>
+<li>Open the project's <strong>Settings</strong>, then <strong>Webhooks</strong>.</li>
+<li>Set the URL to the controller's site origin plus <code>/webhook/gitlab</code>. Use an address GitLab can reach over the company network. A localhost address works only when GitLab runs on that same host.</li>
+<li>Enter the existing <code>GITLAB_WEBHOOK_SECRET</code> value as the secret token. Use the same URL and secret for every project.</li>
+<li>Tick <strong>Merge request events</strong> and <strong>Comments</strong>. Comment events deliver finding commands.</li>
+<li>Enable SSL verification when the controller sits behind TLS.</li>
+<li>Save the webhook. Configure only one FRED webhook per project.</li>
+</ol>
+<p>For an existing FRED webhook, enable <strong>Comments</strong> on that webhook and save it. Do not create a second webhook. Verify command delivery with <a href="run-locally.html#verify-finding-commands">a dedicated fixture MR</a>.</p>
+<p>A project needs both the connected token and the webhook. Until the project is connected, its webhook deliveries return <code>{"ignored":true,"reason":"project not connected to FRED"}</code>.</p>
+
+<h2>Request a review</h2>
+<p>Add <strong>0 FRED</strong> as reviewer on a merge request. FRED reviews again on every push while it stays assigned. On GitLab versions that emit a re-request webhook, re-request the review to review the same commit again. After a failure, remove and re-add <strong>0 FRED</strong>.</p>
+<p>FRED reviews an MR from a fork only when the project token can read the source project. A project access token belongs to its own project, so MRs from forks in other projects are generally not reviewable.</p>
+
+<h2 id="rotate-token">Rotate or replace the token</h2>
+<p>The <strong>Projects</strong> page warns 30 days before the token expires and marks it failed once it has expired or GitLab rejects it. FRED checks every token every six hours; <strong>Check</strong> checks one immediately.</p>
+<ol>
+<li>In GitLab, use <strong>Rotate</strong> on the <code>0 FRED</code> token. Rotation keeps the same bot user.</li>
+<li>In the admin UI, select the project, open <strong>Setup</strong>, click <strong>Replace</strong>, and paste the new value. A token of another project is refused.</li>
+</ol>
+<p>If you create a brand-new token instead, GitLab creates a new bot user. FRED remembers every former bot user of the project, so earlier FRED discussions and summaries remain FRED's. Reviewers must add the new <strong>0 FRED</strong> user; the old one no longer triggers reviews. Revoke the old token after replacing it.</p>
+
+<h2 id="stop-reviews">Stop reviews for a project</h2>
+<ol>
+<li>In the admin UI, select the project, open <strong>Setup</strong>, click <strong>Disconnect</strong>, then <strong>Confirm disconnect</strong>. FRED deletes the stored token.</li>
+<li>In GitLab, disable the project's FRED webhook and revoke the <code>0 FRED</code> token.</li>
+</ol>
+<p>After disconnecting, new review requests are ignored. Reviews and finding commands already queued fail when a worker picks them up, and FRED cannot post their failure comments. Let running reviews finish before disconnecting. Review history, the pipeline, and spend stay. To enable reviews again, connect a new token and re-enable the webhook, then request the review again.</p>
+
+<h2>Verify with one fixture MR</h2>
+<p>Run this check manually against the local controller and a dedicated fixture project, as described in <a href="run-locally.html">the local run guide</a>. Starting reviews spends provider budget and posts to GitLab.</p>
+<ol>
+<li>Connect the fixture project with its <code>0 FRED</code> token in the local admin UI.</li>
+<li>Open an MR in the fixture project and add <strong>0 FRED</strong> as reviewer.</li>
+<li>Check for a summary comment that starts with <code>FRED review</code> and a <code>fred-review::</code> label. If nothing appears, inspect the project webhook deliveries, then the controller and worker logs.</li>
+<li>Verify dismissal and undo with <a href="run-locally.html#verify-finding-commands">the finding-command check</a>. Resolving a GitLab discussion alone does not change its finding disposition or label.</li>
+</ol>
+
+<h2>Optional: add review instructions to a repo</h2>
+<p>To steer both review stages, add <code>REVIEW.md</code> at the repo root. Write the project review rules and name any repo skills to follow. The reviewer can discover every repo <code>SKILL.md</code> and read its reference files. It also reads root <code>AGENTS.md</code>, otherwise <code>CLAUDE.md</code>, for general conventions. Missing review rules produce a feature tip; a missing requested skill produces a hint and review continues. These files cannot enable shell execution or expand sandbox permissions.</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,39 @@
+{
+  "object_kind": "merge_request",
+  "event_type": "merge_request",
+  "user": { "id": 42, "name": "Daniel Kistner", "username": "daniel", "email": "[REDACTED]" },
+  "project": {
+    "id": 7,
+    "name": "flight-management",
+    "path_with_namespace": "frei/flight-management",
+    "web_url": "https://gitlab.example.com/frei/flight-management",
+    "git_http_url": "https://gitlab.example.com/frei/flight-management.git",
+    "default_branch": "main"
+  },
+  "object_attributes": {
+    "id": 93,
+    "iid": 16,
+    "author_id": 42,
+    "title": "Add input validation to booking form",
+    "description": "This merge request adds input validation to the booking form.",
+    "state": "opened",
+    "action": "update",
+    "source_branch": "feature/booking-validation",
+    "target_branch": "main",
+    "source_project_id": 7,
+    "target_project_id": 7,
+    "reviewer_ids": [901],
+    "url": "https://gitlab.example.com/frei/flight-management/-/merge_requests/16",
+    "oldrev": null,
+    "last_commit": {
+      "id": "e59094b8de0f2f91abbe4760a52d9137260252d8",
+      "message": "Validate booking dates",
+      "title": "Validate booking dates",
+      "url": "https://gitlab.example.com/frei/flight-management/-/commit/e59094b8de0f2f91abbe4760a52d9137260252d8",
+      "author": { "name": "Daniel Kistner", "email": "[REDACTED]" }
+    }
+  },
+  "changes": { "reviewers": [ [ { "id": 901, "name": "0 FRED", "username": "project_7_bot_fred", "state": "reviewed", "re_requested": false } ], [ { "id": 901, "name": "0 FRED", "username": "project_7_bot_fred", "state": "unreviewed", "re_requested": true } ] ] },
+  "reviewers": [ { "id": 901, "name": "0 FRED", "username": "project_7_bot_fred", "state": "unreviewed", "re_requested": true } ],
+  "labels": []
+}

@@ -1,0 +1,11 @@
+# FREI's own deployment and archives stay on its GitLab. `git archive`, and so the public GitHub mirror
+# built from it, leaves out every path marked export-ignore.
+/.gitlab-ci.yml export-ignore
+/apps/controller/frei57/ export-ignore
+/apps/controller/nginx/ export-ignore
+/docs/archive/ export-ignore
+/docs/assets/ export-ignore
+/docs/pilot/ export-ignore
+/scripts/deploy.mjs export-ignore
+/scripts/pilot-convex.sh export-ignore
+/scripts/receive-release.sh export-ignore

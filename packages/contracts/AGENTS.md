@@ -1,0 +1,12 @@
+# Contracts
+
+Shared zod schemas. Read the root `AGENTS.md` first. A contract change reaches the worker, controller, and corresponding `docs/reference.html` table together.
+
+- `finding.ts` holds the finding vocabulary: severity, publication status, disposition (open, fixed, dismissed, or retracted), provider, the stage 1 candidate, and the stored finding that extends it. `findingLifecycle.ts` defines validator decisions and the disposition rules the worker shares with the controller. Locations may use a new line, an old line, or a file without a line.
+- `stages.ts` defines the stage outputs and indexed validator verdicts. Stage 2 supplies fixed or retracted decisions with evidence for prior open findings, including summary-only findings without GitLab discussion IDs. The worker validates complete, unique verdict coverage against the actual candidate list.
+- `reviewResult.ts` defines immutable publication intent. The first effect is the single summary, covering every pending finding once. A finding can also have one inline effect that adds its discussion ID. Effect keys and decision finding IDs are unique. `readReviewResult` decodes historical saved intent without rewriting its JSON or effect keys.
+- `provider` is `fred` for every new job, finding, usage row, and note; `retiredProviders` are `claude` and `codex`, which stay readable.
+- `jobs.ts` holds the controller vocabulary the UI shares: trigger kinds, job statuses with `inFlightStatuses` and `finishedStatuses`, and policy `denialGate`s in evaluation order. The controller derives its Convex validators from these enums.
+- `diagnostics.ts` write schemas (`diagnosticEvent`, `diagnosticSnapshot`, `diagnosticFailure`) accept only what current code records. The `stored*` schemas widen them with retired runtime metadata. The controller reads every stored row through them, and only its own lifecycle events may echo a stored failure; worker input always goes through the write schemas. `failureSummary` accepts stored failures.
+- `models.ts` defines a project's review pipeline, `stageModels` with one OpenRouter selection per stage, independently of GitLab bot identity. `defaultStageModels` only prefills a first project connect. Historical job selections remain readable in storage; runtime analysis validates the current contract.
+- Infer types with `z.infer`; keep schemas authoritative. Helpers only the controller uses live in the controller, so contracts depends on zod alone. Export only what another file uses.
